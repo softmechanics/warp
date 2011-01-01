@@ -58,7 +58,7 @@ import Blaze.ByteString.Builder.Char8 (fromChar, fromString)
 import Data.Monoid (mconcat)
 import Network.Socket.SendFile (sendFile)
 
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import System.Timeout (timeout)
 
 run :: Port -> Application -> IO ()
@@ -231,43 +231,43 @@ hasBody :: Status -> Request -> Bool
 hasBody s req = s /= (Status 204 "") && requestMethod req /= "HEAD"
 
 sendResponse :: Request -> HttpVersion -> Socket -> Response -> IO Bool
-sendResponse req hv socket (ResponseFile s hs fp) = do
+sendResponse req hv socket (ResponseFile s hs fp) = {-# SCC "sendResponseFile" #-} do
     Sock.sendMany socket $ L.toChunks $ toLazyByteString $ headers hv s hs False
     if hasBody s req
         then do
             sendFile socket fp
             return $ lookup "content-length" hs /= Nothing
         else return True
-sendResponse req hv socket (ResponseEnumerator res) =
+sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnumerator" #-}
     res go
   where
     go s hs
-        | not (hasBody s req) = do
+        | not (hasBody s req) = {-# SCC "sendResponseEnumerator.noBody" #-} do
             liftIO $ Sock.sendMany socket
                    $ L.toChunks $ toLazyByteString
                    $ headers hv s hs False
             return True
-    go s hs =
-            chunk'
-          $ E.enumList 1 [headers hv s hs isChunked']
-         $$ E.joinI $ builderToByteString
-         $$ (iterSocket socket >> return isKeepAlive)
+    go s hs = {-# SCC "sendResponseEnumerator.hasBody" #-} 
+            chunk' $ 
+            ({-# SCC "sendResponseEnumerator.hasBody.headers" #-} E.enumList 1 [headers hv s hs isChunked'])
+         $$ E.joinI $ ({-# SCC "sendResponseEnumerator.hasBody.builderToByteString" #-} builderToByteString)
+         $$ ({-# SCC "sendResponseEnumerator.hasBody.iterSocket" #-} iterSocket socket >> return isKeepAlive)
       where
-        hasLength = lookup "content-length" hs /= Nothing
-        isChunked' = isChunked hv && not hasLength
-        isKeepAlive = isChunked' || hasLength
-        chunk' i =
+        hasLength = {-# SCC "sendResponseEnumerator.hasBody.hasLength" #-} lookup "content-length" hs /= Nothing
+        isChunked' = {-# SCC "sendResponseEnumerator.hasBody.isChunked'" #-} isChunked hv && not hasLength
+        isKeepAlive = {-# SCC "sendResponseEnumerator.hasBody.isKeepAlive" #-} isChunked' || hasLength
+        chunk' i = {-# SCC "sendResponseEnumerator.hasBody.chunk'" #-}
             if isChunked'
                 then E.joinI $ chunk $$ i
                 else i
         chunk :: E.Enumeratee Builder Builder IO Bool
-        chunk = E.checkDone $ E.continue . step
-        step k E.EOF = k (E.Chunks [chunkedTransferTerminator]) >>== return
-        step k (E.Chunks []) = E.continue $ step k
-        step k (E.Chunks builders) =
+        chunk = {-# SCC "sendResponseEnumerator.hasBody.chunk" #-} E.checkDone $ E.continue . step
+        step k E.EOF = {-# SCC "sendResponseEnumerator.hasBody.stepEOF" #-} k (E.Chunks [chunkedTransferTerminator]) >>== return
+        step k (E.Chunks []) = {-# SCC "sendResponseEnumerator.hasBody.stepEmptyChunks" #-} E.continue $ step k
+        step k (E.Chunks builders) = {-# SCC "sendResponseEnumerator.hasBody.stepChunks" #-}
             k (E.Chunks [chunked]) >>== chunk
           where
-            chunked = chunkedTransferEncoding $ mconcat builders
+            chunked = {-# SCC "sendResponseEnumerator.hasBody.stepChunks.chunked" #-} chunkedTransferEncoding $ mconcat builders
 
 parseHeaderNoAttr :: ByteString -> (ByteString, ByteString)
 parseHeaderNoAttr s =
@@ -307,6 +307,7 @@ requestBodyHandle initLen =
                     then return ()
                     else drain newlen
 
+iterSocket :: MonadIO m => Socket -> E.Iteratee ByteString m ()
 iterSocket socket =
     E.continue go
   where
