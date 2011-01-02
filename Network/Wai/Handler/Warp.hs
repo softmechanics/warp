@@ -53,7 +53,7 @@ import Data.Enumerator.IO (iterHandle, enumHandle)
 import Blaze.ByteString.Builder.Enumerator (builderToByteString)
 import Blaze.ByteString.Builder.HTTP
     (chunkedTransferEncoding, chunkedTransferTerminator)
-import Blaze.ByteString.Builder (fromByteString, Builder, toLazyByteString)
+import Blaze.ByteString.Builder (fromByteString, Builder, toLazyByteString, toByteStringIO)
 import Blaze.ByteString.Builder.Char8 (fromChar, fromString)
 import Data.Monoid (mconcat)
 import Network.Socket.SendFile (sendFile)
@@ -250,7 +250,6 @@ sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnume
     go s hs = {-# SCC "sendResponseEnumerator.hasBody" #-} 
             chunk' $ 
             ({-# SCC "sendResponseEnumerator.hasBody.headers" #-} E.enumList 1 [headers hv s hs isChunked'])
-         $$ E.joinI $ ({-# SCC "sendResponseEnumerator.hasBody.builderToByteString" #-} builderToByteString)
          $$ ({-# SCC "sendResponseEnumerator.hasBody.iterSocket" #-} iterSocket socket >> return isKeepAlive)
       where
         hasLength = {-# SCC "sendResponseEnumerator.hasBody.hasLength" #-} lookup "content-length" hs /= Nothing
@@ -307,12 +306,14 @@ requestBodyHandle initLen =
                     then return ()
                     else drain newlen
 
-iterSocket :: MonadIO m => Socket -> E.Iteratee ByteString m ()
+iterSocket :: MonadIO m => Socket -> E.Iteratee Builder m ()
 iterSocket socket =
     E.continue go
   where
     go E.EOF = E.yield () E.EOF
-    go (E.Chunks cs) = liftIO (Sock.sendMany socket cs) >> E.continue go
+    go (E.Chunks cs) = do
+      liftIO $ mapM_ (toByteStringIO $ Sock.sendAll socket) cs
+      E.continue go
 
 enumSocket len socket (E.Continue k) = do
 #if NO_TIMEOUT_PROTECTION
