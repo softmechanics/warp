@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE BangPatterns #-}
 ---------------------------------------------------------
 -- |
 -- Module        : Network.Wai.Handler.Warp
@@ -27,6 +28,7 @@ import qualified System.IO
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as S
+import qualified Data.ByteString.Unsafe as S
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy as L
 import Network
@@ -58,6 +60,7 @@ import Blaze.ByteString.Builder.Char8 (fromChar, fromString)
 import Data.Monoid (mconcat)
 import Network.Socket.SendFile (sendFile)
 
+import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import System.Timeout (timeout)
 
@@ -90,7 +93,7 @@ serveConnection port app conn remoteHost' = do
         ignoreAll
   where
     ignoreAll :: SomeException -> IO ()
-    ignoreAll _ = return ()
+    ignoreAll e = return ()
     fromClient = enumSocket bytesPerRead conn
     serveConnection' = do
         (enumeratee, env) <- parseRequest port remoteHost'
@@ -108,7 +111,7 @@ maxHeaders, maxHeaderLength, bytesPerRead, readTimeout :: Int
 maxHeaders = 30
 maxHeaderLength = 1024
 bytesPerRead = 4096
-readTimeout = 3000000
+readTimeout = 30000000
 
 takeUntilBlank :: Int
                -> ([ByteString] -> [ByteString])
@@ -121,26 +124,74 @@ takeUntilBlank count front = do
         then return $ front []
         else takeUntilBlank (count + 1) $ front . (:) l
 
+{--
+breakLine :: ByteString -> Maybe (ByteString, ByteString)
+breakLine bs = 
+  case S.elemIndex 10 bs of
+       Nothing -> Nothing
+       Just n  -> 
+        Just (
+           if n == 0
+              then S.empty
+              else S.unsafeTake (n-1) bs
+         , if n == S.length bs
+              then S.empty
+              else S.unsafeDrop (n+1) bs
+         )
+{-# INLINE breakLine #-}
+
 takeLine :: Int
          -> ([ByteString] -> [ByteString])
          -> E.Iteratee ByteString IO ByteString
 takeLine len front = do
-    mbs <- E.head
+    mbs <- {-# SCC "takeLine.mbs" #-} E.head
     case mbs of
         Nothing -> E.throwError IncompleteHeaders
         Just bs -> do
-            let (x, y) = S.breakByte 10 bs
-                x' = if S.length x > 0 && S.last x == 13
-                        then S.init x
-                        else x
-            let len' = len + B.length x
-            case () of
-                ()
-                    | len' > maxHeaderLength -> E.throwError OverLargeHeader
-                    | B.null y -> takeLine len' $ front . (:) x
-                    | otherwise -> do
-                        E.yield () $ E.Chunks [B.drop 1 y]
-                        return $ B.concat $ front [x']
+            case breakLine bs of
+                 Nothing -> do  -- no \n
+                   let len' = {-# SCC "takeLine.len'" #-} len + B.length bs
+                   {-# SCC "takeLine.recurse" #-} takeLine len' $ front . (:) bs
+                 Just (x,y) -> do
+                   let xLen = B.length x
+                   {-# SCC "takeLine.maxHeaderLength" #-} when (len + xLen > maxHeaderLength) $ E.throwError OverLargeHeader
+                   {-# SCC "takeLine.yield" #-} when (not $ B.null y) $ E.yield () $ E.Chunks [y]
+                   {-# SCC "takeLine.concat" #-} return $ B.concat $ front [x]
+--}
+
+{--}
+takeLine :: Int
+         -> ([ByteString] -> [ByteString])
+         -> E.Iteratee ByteString IO ByteString
+takeLine len front = do
+    mbs <- {-# SCC "takeLine.mbs" #-} E.head
+    case mbs of
+        !Nothing -> E.throwError IncompleteHeaders
+        Just !bs -> do
+            case S.elemIndex 10 bs of
+                 !Nothing -> do  -- no \n
+                   let !len' = {-# SCC "takeLine.len'" #-} len + B.length bs
+                   {-# SCC "takeLine.recurse" #-} takeLine len' $! front . (:) bs
+                 Just !n -> do
+                   let !xLen = n - 1       -- drop \r
+                       !restStart = n + 1  -- drop \n
+                       !bsLen = B.length bs
+                       !x = {-# SCC "takeLine.x" #-} if xLen > 0 then S.unsafeTake xLen bs else S.empty
+                   {--
+                   {-# SCC "takeLine.maxHeaderLength" #-} when (len + xLen > maxHeaderLength) $ E.throwError OverLargeHeader
+                   {-# SCC "takeLine.yield" #-} when (restStart < bsLen) $! E.yield () $! E.Chunks [{-# SCC "takeLine.y" #-} S.unsafeDrop restStart bs]
+                   {-# SCC "takeLine.concat" #-} return $ B.concat $ front [x]
+                   --}
+                   {--}
+                   if len + xLen > maxHeaderLength
+                      then E.throwError OverLargeHeader
+                      else 
+                        let !result = {-# SCC "takeLine.concat" #-} B.concat $! front [x]
+                        in if restStart < bsLen
+                              then {-# SCC "takeLine.yield" #-} E.yield result $! E.Chunks [{-# SCC "takeLine.y" #-} S.unsafeDrop restStart bs]
+                              else return result
+                   --}
+--}
 
 data InvalidRequest =
     NotEnoughLines [String]
