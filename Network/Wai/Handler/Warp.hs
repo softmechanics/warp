@@ -31,18 +31,20 @@ import qualified Data.ByteString as S
 import qualified Data.ByteString.Unsafe as S
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy as L
+import Data.Word (Word8)
 import Network
     ( listenOn, sClose, PortID(PortNumber), Socket
     , withSocketsDo)
 import Network.Socket
     ( accept
+    , SockAddr (..)
+    , inet_ntoa
     )
 import qualified Network.Socket.ByteString as Sock
 import Control.Exception (bracket, finally, Exception, SomeException, catch)
 import System.IO (Handle, hClose, hFlush)
 import System.IO.Error (isEOFError, ioeGetHandle)
 import Control.Concurrent (forkIO)
-import Control.Monad (unless, when)
 import Data.Maybe (fromMaybe)
 
 import Data.Typeable (Typeable)
@@ -74,16 +76,21 @@ type Port = Int
 serveConnections :: Port -> Application -> Socket -> IO ()
 serveConnections port app socket = do
     (conn, sa) <- accept socket
-    let remoteHost' = stripPort $ show sa -- FIXME
+    remoteHost' <- socketHost sa
     _ <- forkIO $ serveConnection port app conn remoteHost'
     serveConnections port app socket
   where
-    stripPort s =
-        case break (== ':') $ reverse s of
-            (_, ':' : rest) -> reverse rest
-            _ -> s
+    socketHost (SockAddrInet _ host) = do
+      chost <- inet_ntoa host
+      return $ B.pack chost
+    socketHost sa = 
+      let s = show sa
+      in return $ B.pack $
+         case break (== ':') $ reverse s of
+              (_, ':' : rest) -> reverse rest
+              _ -> s
 
-serveConnection :: Port -> Application -> Socket -> String -> IO ()
+serveConnection :: Port -> Application -> Socket -> ByteString -> IO ()
 serveConnection port app conn remoteHost' = do
     catch
         (finally
@@ -98,9 +105,11 @@ serveConnection port app conn remoteHost' = do
         (enumeratee, env) <- parseRequest port remoteHost'
         res <- E.joinI $ enumeratee $$ app env
         keepAlive <- liftIO $ sendResponse env (httpVersion env) conn res
-        when keepAlive serveConnection'
+        if keepAlive 
+           then serveConnection'
+           else return ()
 
-parseRequest :: Port -> String -> E.Iteratee S.ByteString IO (E.Enumeratee ByteString ByteString IO a, Request)
+parseRequest :: Port -> ByteString -> E.Iteratee S.ByteString IO (E.Enumeratee ByteString ByteString IO a, Request)
 parseRequest port remoteHost' = do
     headers' <- takeHeaders
     parseRequest' port headers' remoteHost'
@@ -189,51 +198,60 @@ instance Exception InvalidRequest
 -- | Parse a set of header lines and body into a 'Request'.
 parseRequest' :: Port
               -> [ByteString]
-              -> String
+              -> ByteString
               -> E.Iteratee S.ByteString IO (E.Enumeratee S.ByteString S.ByteString IO a, Request)
-parseRequest' port lines' remoteHost' = do
-    (firstLine, otherLines) <-
-        case lines' of
-            x:xs -> return (x, xs)
-            [] -> E.throwError $ NotEnoughLines $ map B.unpack lines'
+parseRequest' _ [] _ = E.throwError $ NotEnoughLines []
+parseRequest' port (firstLine:otherLines) remoteHost' = do
     (method, rpath', gets, httpversion) <- parseFirst firstLine
-    let rpath = '/' : case B.unpack rpath' of
-                        ('/':x) -> x
-                        _ -> B.unpack rpath'
-    let heads = map (first mkCIByteString . parseHeaderNoAttr) otherLines
-    let host = fromMaybe "" $ lookup "host" heads
-    let len = fromMaybe 0 $ do
-                bs <- lookup "Content-Length" heads
-                let str = B.unpack bs
-                case reads str of
-                    (x, _):_ -> Just x
-                    _ -> Nothing
-    let (serverName', _) = B.break (== ':') host
+    let rpath = {-# SCC "parseRequest'.rpath" #-} 
+                if B.null rpath'
+                   then "/"
+                   else if '/' == B.head rpath'
+                           then rpath'
+                           else B.cons '/' rpath'
+    let heads = {-# SCC "parseRequest'.heads" #-} map parseHeaderNoAttr otherLines
+    let host = {-# SCC "parseRequest'.host" #-} fromMaybe "" $ lookup "host" heads
+    let len = {-# SCC "parseRequest'.len" #-}
+              case lookup "Content-Length" heads of
+                   Nothing -> 0
+                   Just bs ->
+                     let str = B.unpack bs
+                     in case reads str of
+                             (x, _):_ -> x
+                             _ -> 0
+    let serverName' = {-# SCC "parseRequest'.serverName'" #-} takeUntil 58 host  -- ':'
     return (requestBodyHandle len, Request
                 { requestMethod = method
                 , httpVersion = httpversion
-                , pathInfo = B.pack rpath
+                , pathInfo = rpath
                 , queryString = gets
                 , serverName = serverName'
                 , serverPort = port
                 , requestHeaders = heads
                 , isSecure = False
                 , errorHandler = System.IO.hPutStr System.IO.stderr
-                , remoteHost = B.pack remoteHost'
+                , remoteHost = remoteHost'
                 })
+
+takeUntil :: Word8 -> ByteString -> ByteString
+takeUntil c bs = 
+  case S.elemIndex c bs of
+       Just !idx -> S.unsafeTake idx bs
+       Nothing -> bs
+{-# INLINE takeUntil #-}
 
 parseFirst :: ByteString
            -> E.Iteratee S.ByteString IO (ByteString, ByteString, ByteString, HttpVersion)
 parseFirst s = do
-    let pieces = B.words s
-    (method, query, http') <-
-        case pieces of
-            [x, y, z] -> return (x, y, z)
-            _ -> E.throwError $ BadFirstLine $ B.unpack s
-    let (hfirst, hsecond) = B.splitAt 5 http'
-    unless (hfirst == "HTTP/") $ E.throwError NonHttp
-    let (rpath, qstring) = B.break (== '?') query
-    return (method, rpath, qstring, hsecond)
+    let !pieces = {-# SCC "parseFirst.pieces" #-} B.words s
+    case pieces of
+         [method, query, http'] 
+           | B.isPrefixOf "HTTP/" http' -> do
+             let !httpVersion = {-# SCC "parseFirst.httpVersion" #-} S.unsafeDrop 5 http'
+                 (!rpath, !qstring) = {-# SCC "parseFirst.(rpath,qstring)" #-} S.breakByte 63 query  -- '?'
+             return (method, rpath, qstring, httpVersion)
+           | otherwise -> E.throwError NonHttp
+         _ -> E.throwError $ BadFirstLine $ B.unpack s
 
 headers :: HttpVersion -> Status -> ResponseHeaders -> Bool -> Builder
 headers httpversion status responseHeaders isChunked' = mconcat
@@ -301,16 +319,15 @@ sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnume
           where
             chunked = {-# SCC "sendResponseEnumerator.hasBody.stepChunks.chunked" #-} chunkedTransferEncoding $ mconcat builders
 
-parseHeaderNoAttr :: ByteString -> (ByteString, ByteString)
+parseHeaderNoAttr :: ByteString -> (CIByteString, ByteString)
 parseHeaderNoAttr s =
-    let (k, rest) = B.span (/= ':') s
-        rest' = if not (B.null rest) &&
-                   B.head rest == ':' &&
-                   not (B.null $ B.tail rest) &&
-                   B.head (B.tail rest) == ' '
-                    then B.drop 2 rest
-                    else rest
-     in (k, rest')
+    let (k, rest) = S.breakByte 58 s  -- ':'
+        restLen = {-# SCC "parseHeaderNoAttr.restLen" #-} S.length rest
+        rest' = {-# SCC "parseHeaderNoAttr.rest'" #-} 
+                if restLen > 1 && S.unsafeTake 2 rest == ": "
+                   then S.unsafeDrop 2 rest
+                   else rest
+     in (mkCIByteString k, rest')
 
 requestBodyHandle :: Int
                   -> E.Enumeratee ByteString ByteString IO a
