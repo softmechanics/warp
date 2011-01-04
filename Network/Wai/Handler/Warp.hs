@@ -294,14 +294,14 @@ sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnume
   where
     go s hs
         | not (hasBody s req) = {-# SCC "sendResponseEnumerator.noBody" #-} do
-            liftIO $ Sock.sendMany socket
-                   $ L.toChunks $ toLazyByteString
-                   $ headers hv s hs False
-            return True
+            {-# SCC "sendResponseEnumerator.noBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs isChunked'] 
+            {-# SCC "sendResponseEnumerator.noBody.iterSocket" #-} iterSocket socket
+            return isKeepAlive
     go s hs = {-# SCC "sendResponseEnumerator.hasBody" #-} 
-            chunk' $ 
-            ({-# SCC "sendResponseEnumerator.hasBody.headers" #-} E.enumList 1 [headers hv s hs isChunked'])
-         $$ ({-# SCC "sendResponseEnumerator.hasBody.iterSocket" #-} iterSocket socket >> return isKeepAlive)
+            chunk' $ do
+              {-# SCC "sendResponseEnumerator.hasBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs isChunked'] 
+              {-# SCC "sendResponseEnumerator.hasBody.iterSocket" #-} iterSocket socket
+              return isKeepAlive
       where
         hasLength = {-# SCC "sendResponseEnumerator.hasBody.hasLength" #-} lookup "content-length" hs /= Nothing
         isChunked' = {-# SCC "sendResponseEnumerator.hasBody.isChunked'" #-} isChunked hv && not hasLength
