@@ -361,8 +361,8 @@ iterSocket socket =
     E.continue go
   where
     go E.EOF = E.yield () E.EOF
-    go (E.Chunks cs) = do
-      liftIO $ mapM_ (toByteStringIO $ Sock.sendAll socket) cs
+    go (E.Chunks [cs]) = do
+      liftIO $ toByteStringIO (Sock.sendAll socket) cs
       E.continue go
 
 enumSocket len socket (E.Continue k) = do
