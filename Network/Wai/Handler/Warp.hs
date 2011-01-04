@@ -243,7 +243,7 @@ takeUntil c bs =
 parseFirst :: ByteString
            -> E.Iteratee S.ByteString IO (ByteString, ByteString, ByteString, HttpVersion)
 parseFirst s = do
-    let !pieces = {-# SCC "parseFirst.pieces" #-} B.words s
+    let !pieces = {-# SCC "parseFirst.pieces" #-} S.split 32 s  -- ' '
     case pieces of
          [method, query, http'] 
            | B.isPrefixOf "HTTP/" http' -> do
