@@ -328,9 +328,9 @@ sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnume
   where
     go s hs
         | not (hasBody s req) = {-# SCC "sendResponseEnumerator.noBody" #-} do
-            {-# SCC "sendResponseEnumerator.noBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs isChunked'] 
+            {-# SCC "sendResponseEnumerator.noBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs False] 
             {-# SCC "sendResponseEnumerator.noBody.iterSocket" #-} iterSocket socket
-            return isKeepAlive
+            return True
     go s hs = {-# SCC "sendResponseEnumerator.hasBody" #-} 
             chunk' $ do
               {-# SCC "sendResponseEnumerator.hasBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs isChunked'] 
