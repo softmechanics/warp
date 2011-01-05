@@ -392,14 +392,25 @@ requestBodyHandle initLen =
 
 iterSocket :: MonadIO m => Socket -> E.Iteratee Builder m ()
 iterSocket socket =
-    E.continue $ go mempty
+    E.continue $ go 0 id
   where
-    go !b E.EOF = do
-      liftIO $ Sock.sendMany socket $ L.toChunks $ toLazyByteString b
+    go !len !toChunks E.EOF = do
+      sendChunks $ toChunks []
       E.yield () E.EOF
-    go !b (E.Chunks [cs]) = do
-      E.continue $ go $ mappend b cs
-
+    go !len !toChunks (E.Chunks [cs]) = do
+      let !lbs = toLazyByteString cs
+          !len' = len + L.length lbs
+          !chunks = L.toChunks lbs 
+      if len' < minWrite
+         then E.continue $ go len' (toChunks . (++) chunks)
+         else do
+           sendChunks $ toChunks chunks
+           E.continue $ go 0 id
+    sendChunks chunks = {-# SCC "sendChunks" #-} liftIO $ do
+--      print $ length chunks
+--      print $ map B.length chunks
+      Sock.sendMany socket chunks
+--}
 enumSocket len socket (E.Continue k) = do
 #if NO_TIMEOUT_PROTECTION
     bs <- liftIO $ Sock.recv socket len
