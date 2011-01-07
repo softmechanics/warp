@@ -59,7 +59,7 @@ import Control.Arrow (first)
 import Data.Enumerator (($$), (>>==))
 import qualified Data.Enumerator as E
 import Data.Enumerator.IO (iterHandle, enumHandle)
-import Blaze.ByteString.Builder.Enumerator (builderToByteString)
+import Blaze.ByteString.Builder.Enumerator (builderToByteString, unsafeBuilderToByteString, allocBuffer)
 import Blaze.ByteString.Builder.HTTP
     (chunkedTransferEncoding, chunkedTransferTerminator)
 import Blaze.ByteString.Builder (fromByteString, Builder, toLazyByteString, toByteStringIO)
@@ -436,9 +436,8 @@ iterBuilderWith !bufSize' io = E.continue (createBufferI bufSize')
                BI.Done !pf' _ -> do
                  --liftIO $ print "Done"
                  E.continue $ reuseBufferI fpbuf (pf' `minusPtr` pf)
-               {-
-               BI.BufferFull minSize pf' nextStep  -> do
-                 liftIO $ print "BufferFull"
+               
+               BI.BufferFull !minSize !pf' !nextStep  -> do
                  liftIO $ io [S.PS fpbuf 0 (pf' `minusPtr` pf)]
                  if minSize > bufSize
                     -- alloc larger buffer
@@ -446,51 +445,96 @@ iterBuilderWith !bufSize' io = E.continue (createBufferI bufSize')
                     -- reuse current buffer
                     else fillBuffer fpbuf 0 nextStep
                       
-               BI.InsertByteString pf' bs nextStep  -> do
-                 liftIO $ print "Insert"
+               BI.InsertByteString !pf' !bs !nextStep  -> do
                  let end = if S.null bs
                               then []
                               else [bs]
                  liftIO $ io (S.PS fpbuf 0 (pf' `minusPtr` pf) : end)
                  fillBuffer fpbuf 0 nextStep
-                 -}
+                 
+
 
 iterSocket :: MonadIO m => Socket -> E.Iteratee Builder m ()
+#if ITER_SOCKET_ITER_BUILDER
 iterSocket socket = iterBuilder (Sock.sendMany socket)
--- iterSocket = iterSocketLBS
+#elif ITER_SOCKET_LBS
+iterSocket = iterSocketLBS
+#elif ITER_SOCKET_BUILDER
+iterSocket = iterSocketBuilder
+#else
+iterSocket = iterSocketByteString
+#endif
 {-# INLINE iterSocket #-}
-minWrite=100
+
+minWrite=8*1024
+
 iterSocketLBS :: MonadIO m => Socket -> E.Iteratee Builder m ()
 iterSocketLBS socket =
     E.continue $ go 
   where
+    {-# INLINE go #-}
     go E.EOF = E.yield () E.EOF
-    go (E.Chunks [cs]) = do
-      let !lbs = toLazyByteString cs
-          !len = L.length lbs
-          !chunks = L.toChunks lbs
-      if len < minWrite
-         then E.continue $ go' len $ (++) chunks
-         else do
-           sendChunks chunks
-           E.continue go
+    go (E.Chunks cs) = goChunks cs
+    {-# INLINE go' #-}
     go' !len !toChunks E.EOF = do
       sendChunks $ toChunks []
       E.yield () E.EOF
-    go' !len !toChunks (E.Chunks [cs]) = do
-      let !lbs = toLazyByteString cs
+    go' !len !toChunks (E.Chunks cs) = goChunks' len toChunks cs
+    
+    {-# INLINE goChunks #-}
+    goChunks [] = E.continue $ go
+    goChunks (c:cs) = do
+      let !lbs = toLazyByteString c
+          !len = L.length lbs
+          !chunks = L.toChunks lbs
+      if len < minWrite
+         then goChunks' len ((++) chunks) cs
+         else do
+           sendChunks chunks
+           goChunks cs
+
+    {-# INLINE goChunks' #-}
+    goChunks' !len !toChunks [] = E.continue $ go' len toChunks
+    goChunks' !len !toChunks (c:cs) = do
+      let !lbs = toLazyByteString c
           !len' = len + L.length lbs
           !chunks = L.toChunks lbs 
       if len' < minWrite
-         then E.continue $ go' len' (toChunks . (++) chunks)
+         then goChunks' len' (toChunks . (++) chunks) cs
          else do
            sendChunks $ toChunks chunks
-           E.continue go
+           goChunks cs
 
+    {-# INLINE sendChunks #-}
     sendChunks chunks = {-# SCC "sendChunks" #-} liftIO $ do
 --      print $ chunks
 --      print $ map B.length chunks
       Sock.sendMany socket chunks
+{-# INLINE iterSocketLBS #-}
+
+iterSocketBuilder :: MonadIO m => Socket -> E.Iteratee Builder m ()
+iterSocketBuilder socket =
+    E.continue $ go mempty
+  where    
+    go !b E.EOF = do
+      liftIO $ Sock.sendMany socket $ L.toChunks $ toLazyByteString b
+      E.yield () E.EOF
+    go !b (E.Chunks [cs]) = do
+      E.continue $ go $ mappend b cs
+{-# INLINE iterSocketBuilder #-}
+
+iterSocketByteString :: MonadIO m => Socket -> E.Iteratee Builder m ()
+iterSocketByteString socket = 
+       E.joinI $ ({-# SCC "iterSocketByteString.unsafeBuilderToByteString" #-} unsafeBuilderToByteString (allocBuffer BI.defaultBufferSize))
+       --E.joinI $ ({-# SCC "iterSocketByteString.builderToByteString" #-} builderToByteString)
+    $$ E.continue go
+  where
+    go E.EOF = E.yield () E.EOF
+    go (E.Chunks cs) = do
+      liftIO $ Sock.sendMany socket cs
+      E.continue go
+{-# INLINE iterSocketByteString #-}
+    
 
 enumSocket len socket (E.Continue k) = do
 #if NO_TIMEOUT_PROTECTION
