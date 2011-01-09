@@ -433,12 +433,12 @@ iterBuilderWith !bufSize' io chunked headersBuilder = headers
 
     {-# INLINE chunkBufs #-}
     chunkBufs :: Bool -> [ByteString] -> [ByteString]
-    chunkBufs False bufs | chunked = unsafePerformIO $ (print "chunkBufs") >> return (iterBuilderChunker bufs ++ iterBuilderOnEOF)
+    chunkBufs False bufs | chunked = iterBuilderChunker bufs
     chunkBufs _ bufs = bufs
 
     {-# INLINE chunkBuilder #-}
     chunkBuilder :: Bool -> Builder -> Builder
-    chunkBuilder True b | chunked = unsafePerformIO $ (print "chunkBuilder") >> return (chunkedTransferEncoding b)
+    chunkBuilder True b | chunked = chunkedTransferEncoding b
     chunkBuilder _ b = b
 
     {-# INLINE createBufferI #-}
@@ -452,7 +452,7 @@ iterBuilderWith !bufSize' io chunked headersBuilder = headers
     reuseBufferI :: MonadIO m => Bool -> Int -> ForeignPtr Word8 -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
     reuseBufferI !first !bufSize !fpbuf !offset E.EOF = do
       let bufs = if chunked
-                    then chunkBufs first [S.PS fpbuf 0 offset]
+                    then chunkBufs first [S.PS fpbuf 0 offset] ++ iterBuilderOnEOF
                     else [S.PS fpbuf 0 offset]
       liftIO $ io $ bufs
       E.yield () E.EOF
