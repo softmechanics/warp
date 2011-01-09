@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, BangPatterns #-}
+{-# LANGUAGE OverloadedStrings, BangPatterns, CPP #-}
 import Network.Wai
 import Network.Wai.Handler.Warp
 import Blaze.ByteString.Builder (fromByteString)
@@ -13,7 +13,9 @@ kilos' !b !n = kilos' (b `mappend` kilo) (n-1)
 response n = responseBuilder
     status200
     [ ("Content-Type", "text/plain")
+#ifndef CHUNKED_RESPONSE
     , ("Content-Length", B.pack $ show $ n * 1024)
+#endif
     ]
     $ kilos n
 

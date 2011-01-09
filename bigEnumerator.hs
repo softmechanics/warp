@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, BangPatterns #-}
+{-# LANGUAGE OverloadedStrings, BangPatterns, CPP #-}
 import Network.Wai
 import Network.Wai.Handler.Warp
 import Blaze.ByteString.Builder (fromByteString)
@@ -12,7 +12,9 @@ response n = re
   where re = ResponseEnumerator $ \f -> run_ $ enumList 1 (kilos n) $$ f s h 
         s = status200
         h = [ ("Content-Type", "text/plain")
+#ifndef CHUNKED_RESPONSE
             , ("Content-Length", B.pack $ show $ n * 1024)
+#endif
             ]
 
 main = run 3000 $ const $ return $ response 128
