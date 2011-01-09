@@ -417,47 +417,37 @@ iterBuilderWith :: MonadIO m
                 -> Bool
                 -> Builder
                 -> E.Iteratee Builder m ()
-iterBuilderWith !bufSize' io chunked headersBuilder = headers
+iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI True bufSize')
+  -- FIXME: if not chunked, send add headers to the buf (instead of toLazyByteString)
   where
-    {-# INLINE headers #-}
-    headers = do
-      let fpbuf = S.inlinePerformIO $ S.mallocByteString bufSize'
-          !pf = unsafeForeignPtrToPtr fpbuf
-          !br = BI.BufRange pf (pf `plusPtr` bufSize')
-          (!BI.Builder b) = headersBuilder
-          !step = b (BI.buildStep finalStep)
-          !signal = S.inlinePerformIO $ BI.runBuildStep step br
-      case signal of
-           BI.Done !pf' _ -> do
-             E.continue $ reuseBufferI True bufSize' fpbuf (pf' `minusPtr` pf)
+    {-# INLINE addHeaders #-}
+    addHeaders True bufs = (L.toChunks $ toLazyByteString headersBuilder) ++ bufs
+    addHeaders _ bufs = bufs
 
     {-# INLINE chunkBufs #-}
-    chunkBufs :: Bool -> [ByteString] -> [ByteString]
-    chunkBufs False bufs | chunked = iterBuilderChunker bufs
-    chunkBufs _ bufs = bufs
+    chunkBufs | chunked = iterBuilderChunker 
+              | otherwise = id
 
-    {-# INLINE chunkBuilder #-}
-    chunkBuilder :: Bool -> Builder -> Builder
-    chunkBuilder True b | chunked = chunkedTransferEncoding b
-    chunkBuilder _ b = b
+    {-# INLINE endEOF #-}
+    endEOF | chunked = iterBuilderOnEOF
+           | otherwise = []
 
     {-# INLINE createBufferI #-}
     createBufferI :: MonadIO m => Bool -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
-    createBufferI !first !bufSize' !E.EOF = E.continue (createBufferI first bufSize')
-    createBufferI !first !bufSize' (E.Chunks [!builder]) = do
-      let (!BI.Builder b) = chunkBuilder first builder
-      createBuffer first bufSize' (b (BI.buildStep finalStep))
+    createBufferI !first !bufSize !E.EOF = E.continue (createBufferI first bufSize)
+    createBufferI !first !bufSize (E.Chunks [BI.Builder !b]) = 
+      createBuffer first bufSize (b (BI.buildStep finalStep))
 
     {-# INLINE reuseBufferI #-}
     reuseBufferI :: MonadIO m => Bool -> Int -> ForeignPtr Word8 -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
     reuseBufferI !first !bufSize !fpbuf !offset E.EOF = do
-      let bufs = if chunked
-                    then chunkBufs first [S.PS fpbuf 0 offset] ++ iterBuilderOnEOF
-                    else [S.PS fpbuf 0 offset]
+      let !bufs = addHeaders first $ 
+                  if chunked
+                     then iterBuilderChunker [S.PS fpbuf 0 offset] ++ endEOF
+                     else [S.PS fpbuf 0 offset]
       liftIO $ io $ bufs
       E.yield () E.EOF
-    reuseBufferI !first !bufSize !fpbuf !offset (E.Chunks [!builder]) = do
-      let (BI.Builder !b) = chunkBuilder first builder
+    reuseBufferI !first !bufSize !fpbuf !offset (E.Chunks [BI.Builder !b]) = 
       fillBuffer first bufSize fpbuf offset (b (BI.buildStep finalStep))
 
     {-# INLINE createBuffer #-}
@@ -479,7 +469,7 @@ iterBuilderWith !bufSize' io chunked headersBuilder = headers
              E.continue $ reuseBufferI first bufSize fpbuf (pf' `minusPtr` pf)
            
            BI.BufferFull !minSize !pf' !nextStep  -> do
-             let !bufs = chunkBufs first [S.PS fpbuf 0 (pf' `minusPtr` pf)]
+             let !bufs = addHeaders first $ chunkBufs [S.PS fpbuf 0 (pf' `minusPtr` pf)]
              liftIO $ io bufs
              if minSize > bufSize
                 -- alloc larger buffer
@@ -491,7 +481,7 @@ iterBuilderWith !bufSize' io chunked headersBuilder = headers
              let !end = if S.null bs
                           then []
                           else [bs]
-                 !bufs = chunkBufs first $ S.PS fpbuf 0 (pf' `minusPtr` pf) : end
+                 !bufs = addHeaders first $ chunkBufs $ S.PS fpbuf 0 (pf' `minusPtr` pf) : end
              liftIO $ io bufs
              fillBuffer False bufSize fpbuf 0 nextStep
              
