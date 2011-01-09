@@ -25,6 +25,7 @@ module Network.Wai.Handler.Warp
 import Prelude hiding (catch)
 import Network.Wai
 import qualified System.IO
+import System.IO.Unsafe
 import Foreign (unsafeForeignPtrToPtr, plusPtr, minusPtr, ForeignPtr)
 
 import Data.ByteString (ByteString)
@@ -339,13 +340,13 @@ sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnume
     go s hs = {-# SCC "sendResponseEnumerator.hasBody" #-} 
 #if ITER_SOCKET_ITER_BUILDER
 -- iterBuilder has "inlined" chunking
-            do 
-              liftIO $ Sock.sendMany socket $ L.toChunks $ toLazyByteString $ headers hv s hs isChunked'
+            do
+              iterBuilder (Sock.sendMany socket) iterBuilderChunked $ headers hv s hs isChunked'
 #else
             chunk' $ do
               {-# SCC "sendResponseEnumerator.hasBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs isChunked'] 
-#endif
               {-# SCC "sendResponseEnumerator.hasBody.iterSocket" #-} iterSocket socket
+#endif
               return isKeepAlive
       where
         hasLength = {-# SCC "sendResponseEnumerator.hasBody.hasLength" #-} lookup "content-length" hs /= Nothing
@@ -401,7 +402,7 @@ requestBodyHandle initLen =
                     then return ()
                     else drain newlen
 
-iterBuilder :: MonadIO m => ([ByteString] -> IO ()) -> ([ByteString] -> [ByteString]) -> [ByteString] -> E.Iteratee Builder m ()
+iterBuilder :: MonadIO m => ([ByteString] -> IO ()) -> Bool -> Builder -> E.Iteratee Builder m ()
 iterBuilder = iterBuilderWith BI.defaultBufferSize 
 {-# INLINE iterBuilder #-}
 
@@ -413,81 +414,111 @@ finalStep !(BI.BufRange pf _) = return $ BI.Done pf ()
 iterBuilderWith :: MonadIO m 
                 => Int 
                 -> ([ByteString] -> IO ()) 
-                -> ([ByteString] -> [ByteString])    -- chunker
-                -> [ByteString]                      -- extra data to send on EOF
+                -> Bool
+                -> Builder
                 -> E.Iteratee Builder m ()
-iterBuilderWith !bufSize' io chunker onEOF = E.continue (createBufferI bufSize')
+iterBuilderWith !bufSize' io chunked headersBuilder = headers
   where
+    {-# INLINE headers #-}
+    headers = do
+      let fpbuf = S.inlinePerformIO $ S.mallocByteString bufSize'
+          !pf = unsafeForeignPtrToPtr fpbuf
+          !br = BI.BufRange pf (pf `plusPtr` bufSize')
+          (!BI.Builder b) = headersBuilder
+          !step = b (BI.buildStep finalStep)
+          !signal = S.inlinePerformIO $ BI.runBuildStep step br
+      case signal of
+           BI.Done !pf' _ -> do
+             E.continue $ reuseBufferI True bufSize' fpbuf (pf' `minusPtr` pf)
+
+    {-# INLINE chunkBufs #-}
+    chunkBufs :: Bool -> [ByteString] -> [ByteString]
+    chunkBufs False bufs | chunked = unsafePerformIO $ (print "chunkBufs") >> return (iterBuilderChunker bufs ++ iterBuilderOnEOF)
+    chunkBufs _ bufs = bufs
+
+    {-# INLINE chunkBuilder #-}
+    chunkBuilder :: Bool -> Builder -> Builder
+    chunkBuilder True b | chunked = unsafePerformIO $ (print "chunkBuilder") >> return (chunkedTransferEncoding b)
+    chunkBuilder _ b = b
+
     {-# INLINE createBufferI #-}
-    createBufferI :: MonadIO m => Int -> E.Stream Builder -> E.Iteratee Builder m ()
-    createBufferI !bufSize' !E.EOF = E.continue (createBufferI bufSize')
-    createBufferI !bufSize' (E.Chunks [!BI.Builder b]) = createBuffer bufSize' (b (BI.buildStep finalStep))
+    createBufferI :: MonadIO m => Bool -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
+    createBufferI !first !bufSize' !E.EOF = E.continue (createBufferI first bufSize')
+    createBufferI !first !bufSize' (E.Chunks [!builder]) = do
+      let (!BI.Builder b) = chunkBuilder first builder
+      createBuffer first bufSize' (b (BI.buildStep finalStep))
+
+    {-# INLINE reuseBufferI #-}
+    reuseBufferI :: MonadIO m => Bool -> Int -> ForeignPtr Word8 -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
+    reuseBufferI !first !bufSize !fpbuf !offset E.EOF = do
+      let bufs = if chunked
+                    then chunkBufs first [S.PS fpbuf 0 offset]
+                    else [S.PS fpbuf 0 offset]
+      liftIO $ io $ bufs
+      E.yield () E.EOF
+    reuseBufferI !first !bufSize !fpbuf !offset (E.Chunks [!builder]) = do
+      let (BI.Builder !b) = chunkBuilder first builder
+      fillBuffer first bufSize fpbuf offset (b (BI.buildStep finalStep))
 
     {-# INLINE createBuffer #-}
-    createBuffer :: MonadIO m => Int -> BI.BuildStep () -> E.Iteratee Builder m ()
-    createBuffer !bufSize !b = do
+    createBuffer :: MonadIO m => Bool -> Int -> BI.BuildStep () -> E.Iteratee Builder m ()
+    createBuffer !first !bufSize !b = do
       let fpbuf = S.inlinePerformIO $ S.mallocByteString bufSize
-      fillBuffer fpbuf 0 b
+      fillBuffer first bufSize fpbuf 0 b
 
-      where
-        {-# INLINE reuseBufferI #-}
-        reuseBufferI :: MonadIO m => ForeignPtr Word8 -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
-        reuseBufferI !fpbuf !offset E.EOF = do
-          liftIO $ io $ chunker [S.PS fpbuf 0 offset] ++ onEOF
-          E.yield () E.EOF
-        reuseBufferI !fpbuf !offset (E.Chunks [!BI.Builder b]) = fillBuffer fpbuf offset (b (BI.buildStep finalStep))
-
-        {-# INLINE fillBuffer #-}
-        fillBuffer !fpbuf !offset !step = do
-          let !pf = unsafeForeignPtrToPtr fpbuf
-              !br = BI.BufRange (pf `plusPtr` offset) (pf `plusPtr` bufSize)
-              -- safe due to later reference of fpbuf
-              -- BETTER than withForeignPtr, as we lose a tail call otherwise
-              !signal = S.inlinePerformIO $ BI.runBuildStep step br
-          case signal of
-               BI.Done !pf' _ -> do
-                 --liftIO $ print "Done"
-                 E.continue $ reuseBufferI fpbuf (pf' `minusPtr` pf)
-               
-               BI.BufferFull !minSize !pf' !nextStep  -> do
-                 liftIO $ io $ chunker [S.PS fpbuf 0 (pf' `minusPtr` pf)]
-                 if minSize > bufSize
-                    -- alloc larger buffer
-                    then createBuffer minSize nextStep
-                    -- reuse current buffer
-                    else fillBuffer fpbuf 0 nextStep
-                      
-               BI.InsertByteString !pf' !bs !nextStep  -> do
-                 let end = if S.null bs
-                              then []
-                              else [bs]
-                 liftIO $ io $ chunker (S.PS fpbuf 0 (pf' `minusPtr` pf) : end)
-                 fillBuffer fpbuf 0 nextStep
-                 
+    {-# INLINE fillBuffer #-}
+    fillBuffer !first !bufSize !fpbuf !offset !step = do
+      let !pf = unsafeForeignPtrToPtr fpbuf
+          !br = BI.BufRange (pf `plusPtr` offset) (pf `plusPtr` bufSize)
+          -- safe due to later reference of fpbuf
+          -- BETTER than withForeignPtr, as we lose a tail call otherwise
+          !signal = S.inlinePerformIO $ BI.runBuildStep step br
+      case signal of
+           BI.Done !pf' _ -> do
+             --liftIO $ print "Done"
+             E.continue $ reuseBufferI first bufSize fpbuf (pf' `minusPtr` pf)
+           
+           BI.BufferFull !minSize !pf' !nextStep  -> do
+             let !bufs = chunkBufs first [S.PS fpbuf 0 (pf' `minusPtr` pf)]
+             liftIO $ io bufs
+             if minSize > bufSize
+                -- alloc larger buffer
+                then createBuffer False minSize nextStep
+                -- reuse current buffer
+                else fillBuffer False bufSize fpbuf 0 nextStep
+                  
+           BI.InsertByteString !pf' !bs !nextStep  -> do
+             let !end = if S.null bs
+                          then []
+                          else [bs]
+                 !bufs = chunkBufs first $ S.PS fpbuf 0 (pf' `minusPtr` pf) : end
+             liftIO $ io bufs
+             fillBuffer False bufSize fpbuf 0 nextStep
+             
 
 -- extra data to send on EOF (probably a better way to do this...)
 iterBuilderOnEOF :: [ByteString]
-#if CHUNKED_RESPONSE
 iterBuilderOnEOF = ["\r\n0\r\n\r\n"]
+
+iterBuilderChunked :: Bool
+#if CHUNKED_RESPONSE
+iterBuilderChunked = True
 #else
-iterBuilderOnEOF = []
+iterBuilderChunked = False
 #endif
 
 iterBuilderChunker :: [ByteString] -> [ByteString]
-#if CHUNKED_RESPONSE
 iterBuilderChunker bufs = c:bufs
   where c = B.pack $ showHex len "\r\n"
         len = foldl' (\l s -> l + B.length s) 0 bufs
-#else
-iterBuilderChunker = id
-#endif
 {-# INLINE iterBuilderChunker #-}
 
 
 
 iterSocket :: MonadIO m => Socket -> E.Iteratee Builder m ()
 #if ITER_SOCKET_ITER_BUILDER
-iterSocket socket = iterBuilder (Sock.sendMany socket) iterBuilderChunker iterBuilderOnEOF
+--iterSocket socket = iterBuilder (Sock.sendMany socket) iterBuilderChunked
+iterSocket = undefined
 #elif ITER_SOCKET_LBS
 iterSocket = iterSocketLBS
 #elif ITER_SOCKET_BUILDER
