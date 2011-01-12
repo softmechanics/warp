@@ -320,13 +320,13 @@ sendResponse req hv socket (ResponseFile s hs fp) = {-# SCC "sendResponseFile" #
         else return True
 sendResponse req hv socket (ResponseBuilder s hs b) = do
     toByteStringIO (Sock.sendAll socket) b'
+    toByteStringIO (Sock.sendAll socket) chunkedTransferTerminator
     return isKeepAlive
   where
     b' =
         if isChunked'
             then headers hv s hs True
                      `mappend` chunkedTransferEncoding b
-                     `mappend` chunkedTransferTerminator
             else headers hv s hs False `mappend` b
     hasLength = lookup "content-length" hs /= Nothing
     isChunked' = isChunked hv && not hasLength
