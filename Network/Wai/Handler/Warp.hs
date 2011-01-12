@@ -63,7 +63,7 @@ import Data.Enumerator.IO (iterHandle, enumHandle)
 import Blaze.ByteString.Builder.Enumerator (builderToByteString, unsafeBuilderToByteString, allocBuffer)
 import Blaze.ByteString.Builder.HTTP
     (chunkedTransferEncoding, chunkedTransferTerminator)
-import Blaze.ByteString.Builder (fromByteString, Builder, toLazyByteString, toByteStringIO)
+import Blaze.ByteString.Builder (copyByteString, Builder, toLazyByteString, toByteStringIO)
 import Blaze.ByteString.Builder.Char8 (fromChar, fromString)
 import Data.Monoid (mappend, mempty)
 import Network.Socket.SendFile (sendFile)
@@ -95,7 +95,7 @@ serveConnection port app conn remoteHost' = do
         ignoreAll
   where
     ignoreAll :: SomeException -> IO ()
-    ignoreAll e = return ()
+    ignoreAll e = print e -- return ()
     fromClient = enumSocket bytesPerRead conn
     serveConnection' = do
         (enumeratee, env) <- parseRequest port remoteHost'
@@ -124,11 +124,11 @@ takeHeaders = do
 {-# INLINE takeHeaders #-}
 
 takeHeaders' :: Int
-           -> ([ByteString] -> [ByteString])
-           -> Int
-           -> ([ByteString] -> [ByteString])
-           -> ByteString
-           -> E.Iteratee S.ByteString IO [ByteString]
+             -> ([ByteString] -> [ByteString])
+             -> Int
+             -> ([ByteString] -> [ByteString])
+             -> ByteString
+             -> E.Iteratee S.ByteString IO [ByteString]
 takeHeaders' !n !lines !lineLen !prepend !bs = do
   let !bsLen = {-# SCC "takeHeaders'.bsLen" #-} S.length bs
       !mnl = {-# SCC "takeHeaders'.mnl" #-} S.elemIndex 10 bs
@@ -251,20 +251,20 @@ parseFirst s = do
 {-# INLINE parseFirst #-}
 
 {--}
-httpBuilder = fromByteString "HTTP/"
+httpBuilder = copyByteString "HTTP/"
 spaceBuilder = fromChar ' '
-newlineBuilder = fromByteString "\r\n"
-transferEncodingBuilder = fromByteString "Transfer-Encoding: chunked\r\n\r\n"
-colonSpaceBuilder = fromByteString ": "
+newlineBuilder = copyByteString "\r\n"
+transferEncodingBuilder = copyByteString "Transfer-Encoding: chunked\r\n\r\n"
+colonSpaceBuilder = copyByteString ": "
 
 headers :: HttpVersion -> Status -> ResponseHeaders -> Bool -> Builder
 headers !httpversion !status !responseHeaders !isChunked' = {-# SCC "headers" #-}
     let !start = httpBuilder
-                `mappend` fromByteString httpversion
+                `mappend` copyByteString httpversion
                 `mappend` spaceBuilder
                 `mappend` (fromString $ show $ statusCode status)
                 `mappend` spaceBuilder
-                `mappend` (fromByteString $ statusMessage status)
+                `mappend` (copyByteString $ statusMessage status)
                 `mappend` newlineBuilder
         !start' = foldl' responseHeaderToBuilder start responseHeaders
         !end = if isChunked'
@@ -274,9 +274,9 @@ headers !httpversion !status !responseHeaders !isChunked' = {-# SCC "headers" #-
 
 responseHeaderToBuilder :: Builder -> (CIByteString, ByteString) -> Builder
 responseHeaderToBuilder b (x, y) = b
-  `mappend` (fromByteString $ ciOriginal x)
+  `mappend` (copyByteString $ ciOriginal x)
   `mappend` colonSpaceBuilder
-  `mappend` fromByteString y
+  `mappend` copyByteString y
   `mappend` newlineBuilder
 --}
 
@@ -318,6 +318,19 @@ sendResponse req hv socket (ResponseFile s hs fp) = {-# SCC "sendResponseFile" #
             sendFile socket fp
             return $ lookup "content-length" hs /= Nothing
         else return True
+sendResponse req hv socket (ResponseBuilder s hs b) = do
+    toByteStringIO (Sock.sendAll socket) b'
+    return isKeepAlive
+  where
+    b' =
+        if isChunked'
+            then headers hv s hs True
+                     `mappend` chunkedTransferEncoding b
+                     `mappend` chunkedTransferTerminator
+            else headers hv s hs False `mappend` b
+    hasLength = lookup "content-length" hs /= Nothing
+    isChunked' = isChunked hv && not hasLength
+    isKeepAlive = isChunked' || hasLength
 sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnumerator" #-}
     res go
   where
