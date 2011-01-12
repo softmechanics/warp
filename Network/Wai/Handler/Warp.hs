@@ -83,21 +83,10 @@ type Port = Int
 serveConnections :: Port -> Application -> Socket -> IO ()
 serveConnections port app socket = do
     (conn, sa) <- accept socket
-    remoteHost' <- socketHost sa
-    _ <- forkIO $ serveConnection port app conn remoteHost'
+    _ <- forkIO $ serveConnection port app conn sa
     serveConnections port app socket
-  where
-    socketHost (SockAddrInet _ host) = do
-      chost <- inet_ntoa host
-      return $ B.pack chost
-    socketHost sa = 
-      let s = show sa
-      in return $ B.pack $
-         case break (== ':') $ reverse s of
-              (_, ':' : rest) -> reverse rest
-              _ -> s
 
-serveConnection :: Port -> Application -> Socket -> ByteString -> IO ()
+serveConnection :: Port -> Application -> Socket -> SockAddr -> IO ()
 serveConnection port app conn remoteHost' = do
     catch
         (finally
@@ -116,7 +105,7 @@ serveConnection port app conn remoteHost' = do
            then serveConnection'
            else return ()
 
-parseRequest :: Port -> ByteString -> E.Iteratee S.ByteString IO (E.Enumeratee ByteString ByteString IO a, Request)
+parseRequest :: Port -> SockAddr -> E.Iteratee S.ByteString IO (E.Enumeratee ByteString ByteString IO a, Request)
 parseRequest port remoteHost' = do
     headers' <- takeHeaders
     parseRequest' port headers' remoteHost'
@@ -205,7 +194,7 @@ instance Exception InvalidRequest
 -- | Parse a set of header lines and body into a 'Request'.
 parseRequest' :: Port
               -> [ByteString]
-              -> ByteString
+              -> SockAddr
               -> E.Iteratee S.ByteString IO (E.Enumeratee S.ByteString S.ByteString IO a, Request)
 parseRequest' _ [] _ = E.throwError $ NotEnoughLines []
 parseRequest' port (firstLine:otherLines) remoteHost' = do

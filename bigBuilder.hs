@@ -10,7 +10,7 @@ kilos = kilos' mempty
 kilos' !b !0 = b
 kilos' !b !n = kilos' (b `mappend` kilo) (n-1)
 
-response n = responseBuilder
+response n = ResponseBuilder
     status200
     [ ("Content-Type", "text/plain")
 #ifndef CHUNKED_RESPONSE
