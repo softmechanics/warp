@@ -25,14 +25,9 @@ module Network.Wai.Handler.Warp
 import Prelude hiding (catch)
 import Network.Wai
 import qualified System.IO
-import System.IO.Unsafe
-import Foreign (unsafeForeignPtrToPtr, plusPtr, minusPtr, ForeignPtr)
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as S
-import qualified Data.ByteString.Internal as S
-import qualified Blaze.ByteString.Builder.Internal as BI
-import qualified Blaze.ByteString.Builder.Internal.Types as BI
 import qualified Data.ByteString.Unsafe as S
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy as L
@@ -42,9 +37,7 @@ import Network
     ( listenOn, sClose, PortID(PortNumber), Socket
     , withSocketsDo)
 import Network.Socket
-    ( accept
-    , SockAddr (..)
-    , inet_ntoa
+    ( accept, SockAddr
     )
 import qualified Network.Socket.ByteString as Sock
 import Control.Exception (bracket, finally, Exception, SomeException, catch)
@@ -60,17 +53,16 @@ import Control.Arrow (first)
 import Data.Enumerator (($$), (>>==))
 import qualified Data.Enumerator as E
 import Data.Enumerator.IO (iterHandle, enumHandle)
-import Blaze.ByteString.Builder.Enumerator (builderToByteString, unsafeBuilderToByteString, allocBuffer)
+import Blaze.ByteString.Builder.Enumerator (builderToByteString)
 import Blaze.ByteString.Builder.HTTP
     (chunkedTransferEncoding, chunkedTransferTerminator)
-import Blaze.ByteString.Builder (fromByteString, Builder, toLazyByteString, toByteStringIO)
+import Blaze.ByteString.Builder (insertByteString, Builder, toLazyByteString, toByteStringIO)
 import Blaze.ByteString.Builder.Char8 (fromChar, fromString)
 import Data.Monoid (mappend, mempty)
 import Network.Socket.SendFile (sendFile)
 
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import System.Timeout (timeout)
-import Numeric (showHex)
 
 run :: Port -> Application -> IO ()
 run port = withSocketsDo .
@@ -83,21 +75,10 @@ type Port = Int
 serveConnections :: Port -> Application -> Socket -> IO ()
 serveConnections port app socket = do
     (conn, sa) <- accept socket
-    remoteHost' <- socketHost sa
-    _ <- forkIO $ serveConnection port app conn remoteHost'
+    _ <- forkIO $ serveConnection port app conn sa
     serveConnections port app socket
-  where
-    socketHost (SockAddrInet _ host) = do
-      chost <- inet_ntoa host
-      return $ B.pack chost
-    socketHost sa = 
-      let s = show sa
-      in return $ B.pack $
-         case break (== ':') $ reverse s of
-              (_, ':' : rest) -> reverse rest
-              _ -> s
 
-serveConnection :: Port -> Application -> Socket -> ByteString -> IO ()
+serveConnection :: Port -> Application -> Socket -> SockAddr -> IO ()
 serveConnection port app conn remoteHost' = do
     catch
         (finally
@@ -116,7 +97,7 @@ serveConnection port app conn remoteHost' = do
            then serveConnection'
            else return ()
 
-parseRequest :: Port -> ByteString -> E.Iteratee S.ByteString IO (E.Enumeratee ByteString ByteString IO a, Request)
+parseRequest :: Port -> SockAddr -> E.Iteratee S.ByteString IO (E.Enumeratee ByteString ByteString IO a, Request)
 parseRequest port remoteHost' = do
     headers' <- takeHeaders
     parseRequest' port headers' remoteHost'
@@ -126,7 +107,7 @@ maxHeaders, maxHeaderLength, bytesPerRead, readTimeout :: Int
 maxHeaders = 30
 maxHeaderLength = 1024
 bytesPerRead = 4096
-readTimeout = 30000000
+readTimeout = 3000000
 
 takeHeaders :: E.Iteratee S.ByteString IO [ByteString]
 takeHeaders = do
@@ -205,7 +186,7 @@ instance Exception InvalidRequest
 -- | Parse a set of header lines and body into a 'Request'.
 parseRequest' :: Port
               -> [ByteString]
-              -> ByteString
+              -> SockAddr
               -> E.Iteratee S.ByteString IO (E.Enumeratee S.ByteString S.ByteString IO a, Request)
 parseRequest' _ [] _ = E.throwError $ NotEnoughLines []
 parseRequest' port (firstLine:otherLines) remoteHost' = do
@@ -261,21 +242,20 @@ parseFirst s = do
          _ -> E.throwError $ BadFirstLine $ B.unpack s
 {-# INLINE parseFirst #-}
 
-{--}
-httpBuilder = fromByteString "HTTP/"
+httpBuilder = insertByteString "HTTP/"
 spaceBuilder = fromChar ' '
-newlineBuilder = fromByteString "\r\n"
-transferEncodingBuilder = fromByteString "Transfer-Encoding: chunked\r\n\r\n"
-colonSpaceBuilder = fromByteString ": "
+newlineBuilder = insertByteString "\r\n"
+transferEncodingBuilder = insertByteString "Transfer-Encoding: chunked\r\n\r\n"
+colonSpaceBuilder = insertByteString ": "
 
 headers :: HttpVersion -> Status -> ResponseHeaders -> Bool -> Builder
 headers !httpversion !status !responseHeaders !isChunked' = {-# SCC "headers" #-}
     let !start = httpBuilder
-                `mappend` fromByteString httpversion
+                `mappend` insertByteString httpversion
                 `mappend` spaceBuilder
                 `mappend` (fromString $ show $ statusCode status)
                 `mappend` spaceBuilder
-                `mappend` (fromByteString $ statusMessage status)
+                `mappend` (insertByteString $ statusMessage status)
                 `mappend` newlineBuilder
         !start' = foldl' responseHeaderToBuilder start responseHeaders
         !end = if isChunked'
@@ -285,35 +265,11 @@ headers !httpversion !status !responseHeaders !isChunked' = {-# SCC "headers" #-
 
 responseHeaderToBuilder :: Builder -> (CIByteString, ByteString) -> Builder
 responseHeaderToBuilder b (x, y) = b
-  `mappend` (fromByteString $ ciOriginal x)
+  `mappend` (insertByteString $ ciOriginal x)
   `mappend` colonSpaceBuilder
-  `mappend` fromByteString y
+  `mappend` insertByteString y
   `mappend` newlineBuilder
---}
-
-{--
-headers :: HttpVersion -> Status -> ResponseHeaders -> Bool -> Builder
-headers httpversion status responseHeaders isChunked' = {-# SCC "headers" #-}
-    let !start = fromByteString "HTTP/"
-                `mappend` fromByteString httpversion
-                `mappend` fromChar ' '
-                `mappend` (fromString $ show $ statusCode status)
-                `mappend` fromChar ' '
-                `mappend` (fromByteString $ statusMessage status)
-                `mappend` fromByteString "\r\n"
-        !start' = foldl' responseHeaderToBuilder start responseHeaders
-        !end = if isChunked'
-                 then fromByteString "Transfer-Encoding: chunked\r\n\r\n"
-                 else fromByteString "\r\n"
-    in mappend start' end
-    where
-      responseHeaderToBuilder :: Builder -> (CIByteString, ByteString) -> Builder
-      responseHeaderToBuilder b (x, y) = b
-        `mappend` (fromByteString $ ciOriginal x)
-        `mappend` fromByteString ": "
-        `mappend` fromByteString y
-        `mappend` fromByteString "\r\n"
---}
+{-# INLINE responseHeaderToBuilder #-}
 
 isChunked :: HttpVersion -> Bool
 isChunked = (==) http11
@@ -329,6 +285,19 @@ sendResponse req hv socket (ResponseFile s hs fp) = {-# SCC "sendResponseFile" #
             sendFile socket fp
             return $ lookup "content-length" hs /= Nothing
         else return True
+sendResponse req hv socket (ResponseBuilder s hs b) = do
+    toByteStringIO (Sock.sendAll socket) b'
+    return isKeepAlive
+  where
+    b' =
+        if isChunked'
+            then headers hv s hs True
+                     `mappend` chunkedTransferEncoding b
+                     `mappend` chunkedTransferTerminator
+            else headers hv s hs False `mappend` b
+    hasLength = lookup "content-length" hs /= Nothing
+    isChunked' = isChunked hv && not hasLength
+    isKeepAlive = isChunked' || hasLength
 sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnumerator" #-}
     res go
   where
@@ -338,15 +307,9 @@ sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnume
             {-# SCC "sendResponseEnumerator.noBody.iterSocket" #-} iterSocket socket
             return True
     go s hs = {-# SCC "sendResponseEnumerator.hasBody" #-} 
-#if ITER_SOCKET_ITER_BUILDER
--- iterBuilder has "inlined" chunking
-            do
-              iterBuilder (Sock.sendMany socket) iterBuilderChunked $ headers hv s hs isChunked'
-#else
             chunk' $ do
               {-# SCC "sendResponseEnumerator.hasBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs isChunked'] 
               {-# SCC "sendResponseEnumerator.hasBody.iterSocket" #-} iterSocket socket
-#endif
               return isKeepAlive
       where
         hasLength = {-# SCC "sendResponseEnumerator.hasBody.hasLength" #-} lookup "content-length" hs /= Nothing
@@ -386,8 +349,8 @@ requestBodyHandle initLen =
         case x of
             Nothing -> return $ E.Continue k
             Just bs -> do
-                let newlen = max 0 $ len - B.length bs
-                k (E.Chunks [bs]) >>== go newlen
+                (bs', newlen) <- yieldExtra len bs
+                k (E.Chunks [bs']) >>== go newlen
     go len step = do
         drain len
         return step
@@ -397,196 +360,25 @@ requestBodyHandle initLen =
         case mbs of
             Nothing -> return ()
             Just bs -> do
-                let newlen = len - B.length bs
-                if newlen <= 0
-                    then return ()
-                    else drain newlen
-
-iterBuilder :: MonadIO m => ([ByteString] -> IO ()) -> Bool -> Builder -> E.Iteratee Builder m ()
-iterBuilder = iterBuilderWith BI.defaultBufferSize 
-{-# INLINE iterBuilder #-}
-
-finalStep :: BI.BufRange -> IO (BI.BuildSignal ())
-finalStep !(BI.BufRange pf _) = return $ BI.Done pf ()
-{-# INLINE finalStep #-}
-
-{-# INLINE iterBuilderWith #-}
-iterBuilderWith :: MonadIO m 
-                => Int 
-                -> ([ByteString] -> IO ()) 
-                -> Bool
-                -> Builder
-                -> E.Iteratee Builder m ()
-iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI True bufSize')
-  -- FIXME: if not chunked, send add headers to the buf (instead of toLazyByteString)
-  where
-    {-# INLINE addHeaders #-}
-    addHeaders True bufs = (L.toChunks $ toLazyByteString headersBuilder) ++ bufs
-    addHeaders _ bufs = bufs
-
-    {-# INLINE chunkBufs #-}
-    chunkBufs | chunked = iterBuilderChunker 
-              | otherwise = id
-
-    {-# INLINE endEOF #-}
-    endEOF | chunked = iterBuilderOnEOF
-           | otherwise = []
-
-    {-# INLINE createBufferI #-}
-    createBufferI :: MonadIO m => Bool -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
-    createBufferI !first !bufSize !E.EOF = E.continue (createBufferI first bufSize)
-    createBufferI !first !bufSize (E.Chunks [BI.Builder !b]) = 
-      createBuffer first bufSize (b (BI.buildStep finalStep))
-
-    {-# INLINE reuseBufferI #-}
-    reuseBufferI :: MonadIO m => Bool -> Int -> ForeignPtr Word8 -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
-    reuseBufferI !first !bufSize !fpbuf !offset E.EOF = do
-      let !bufs = addHeaders first $ 
-                  if chunked
-                     then iterBuilderChunker [S.PS fpbuf 0 offset] ++ endEOF
-                     else [S.PS fpbuf 0 offset]
-      liftIO $ io $ bufs
-      E.yield () E.EOF
-    reuseBufferI !first !bufSize !fpbuf !offset (E.Chunks [BI.Builder !b]) = 
-      fillBuffer first bufSize fpbuf offset (b (BI.buildStep finalStep))
-
-    {-# INLINE createBuffer #-}
-    createBuffer :: MonadIO m => Bool -> Int -> BI.BuildStep () -> E.Iteratee Builder m ()
-    createBuffer !first !bufSize !b = do
-      let fpbuf = S.inlinePerformIO $ S.mallocByteString bufSize
-      fillBuffer first bufSize fpbuf 0 b
-
-    {-# INLINE fillBuffer #-}
-    fillBuffer !first !bufSize !fpbuf !offset !step = do
-      let !pf = unsafeForeignPtrToPtr fpbuf
-          !br = BI.BufRange (pf `plusPtr` offset) (pf `plusPtr` bufSize)
-          -- safe due to later reference of fpbuf
-          -- BETTER than withForeignPtr, as we lose a tail call otherwise
-          !signal = S.inlinePerformIO $ BI.runBuildStep step br
-      case signal of
-           BI.Done !pf' _ -> do
-             --liftIO $ print "Done"
-             E.continue $ reuseBufferI first bufSize fpbuf (pf' `minusPtr` pf)
-           
-           BI.BufferFull !minSize !pf' !nextStep  -> do
-             let !bufs = addHeaders first $ chunkBufs [S.PS fpbuf 0 (pf' `minusPtr` pf)]
-             liftIO $ io bufs
-             if minSize > bufSize
-                -- alloc larger buffer
-                then createBuffer False minSize nextStep
-                -- reuse current buffer
-                else fillBuffer False bufSize fpbuf 0 nextStep
-                  
-           BI.InsertByteString !pf' !bs !nextStep  -> do
-             let !end = if S.null bs
-                          then []
-                          else [bs]
-                 !bufs = addHeaders first $ chunkBufs $ S.PS fpbuf 0 (pf' `minusPtr` pf) : end
-             liftIO $ io bufs
-             fillBuffer False bufSize fpbuf 0 nextStep
-             
-
--- extra data to send on EOF (probably a better way to do this...)
-iterBuilderOnEOF :: [ByteString]
-iterBuilderOnEOF = ["\r\n0\r\n\r\n"]
-
-iterBuilderChunked :: Bool
-#if CHUNKED_RESPONSE
-iterBuilderChunked = True
-#else
-iterBuilderChunked = False
-#endif
-
-iterBuilderChunker :: [ByteString] -> [ByteString]
-iterBuilderChunker bufs = c:bufs
-  where c = B.pack $ showHex len "\r\n"
-        len = foldl' (\l s -> l + B.length s) 0 bufs
-{-# INLINE iterBuilderChunker #-}
-
-
+                (bs', newlen) <- yieldExtra len bs
+                drain newlen
+    yieldExtra len bs
+        | B.length bs == len = return (bs, 0)
+        | B.length bs < len = return (bs, len - B.length bs)
+        | otherwise = do
+            let (x, y) = B.splitAt len bs
+            E.yield () $ E.Chunks [y]
+            return (x, 0)
 
 iterSocket :: MonadIO m => Socket -> E.Iteratee Builder m ()
-#if ITER_SOCKET_ITER_BUILDER
---iterSocket socket = iterBuilder (Sock.sendMany socket) iterBuilderChunked
-iterSocket = undefined
-#elif ITER_SOCKET_LBS
-iterSocket = iterSocketLBS
-#elif ITER_SOCKET_BUILDER
-iterSocket = iterSocketBuilder
-#else
-iterSocket = iterSocketByteString
-#endif
-{-# INLINE iterSocket #-}
-
-minWrite=8*1024
-
-iterSocketLBS :: MonadIO m => Socket -> E.Iteratee Builder m ()
-iterSocketLBS socket =
-    E.continue $ go 
-  where
-    {-# INLINE go #-}
-    go E.EOF = E.yield () E.EOF
-    go (E.Chunks cs) = goChunks cs
-    {-# INLINE go' #-}
-    go' !len !toChunks E.EOF = do
-      sendChunks $ toChunks []
-      E.yield () E.EOF
-    go' !len !toChunks (E.Chunks cs) = goChunks' len toChunks cs
-    
-    {-# INLINE goChunks #-}
-    goChunks [] = E.continue $ go
-    goChunks (c:cs) = do
-      let !lbs = toLazyByteString c
-          !len = L.length lbs
-          !chunks = L.toChunks lbs
-      if len < minWrite
-         then goChunks' len ((++) chunks) cs
-         else do
-           sendChunks chunks
-           goChunks cs
-
-    {-# INLINE goChunks' #-}
-    goChunks' !len !toChunks [] = E.continue $ go' len toChunks
-    goChunks' !len !toChunks (c:cs) = do
-      let !lbs = toLazyByteString c
-          !len' = len + L.length lbs
-          !chunks = L.toChunks lbs 
-      if len' < minWrite
-         then goChunks' len' (toChunks . (++) chunks) cs
-         else do
-           sendChunks $ toChunks chunks
-           goChunks cs
-
-    {-# INLINE sendChunks #-}
-    sendChunks chunks = {-# SCC "sendChunks" #-} liftIO $ do
---      print $ chunks
---      print $ map B.length chunks
-      Sock.sendMany socket chunks
-{-# INLINE iterSocketLBS #-}
-
-iterSocketBuilder :: MonadIO m => Socket -> E.Iteratee Builder m ()
-iterSocketBuilder socket =
+iterSocket socket =
     E.continue $ go mempty
-  where    
+  where
     go !b E.EOF = do
       liftIO $ Sock.sendMany socket $ L.toChunks $ toLazyByteString b
       E.yield () E.EOF
     go !b (E.Chunks [cs]) = do
       E.continue $ go $ mappend b cs
-{-# INLINE iterSocketBuilder #-}
-
-iterSocketByteString :: MonadIO m => Socket -> E.Iteratee Builder m ()
-iterSocketByteString socket = 
-       E.joinI $ ({-# SCC "iterSocketByteString.unsafeBuilderToByteString" #-} unsafeBuilderToByteString (allocBuffer BI.defaultBufferSize))
-       --E.joinI $ ({-# SCC "iterSocketByteString.builderToByteString" #-} builderToByteString)
-    $$ E.continue go
-  where
-    go E.EOF = E.yield () E.EOF
-    go (E.Chunks cs) = do
-      liftIO $ Sock.sendMany socket cs
-      E.continue go
-{-# INLINE iterSocketByteString #-}
-    
 
 enumSocket len socket (E.Continue k) = do
 #if NO_TIMEOUT_PROTECTION
