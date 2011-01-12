@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE BangPatterns #-}
 ---------------------------------------------------------
 -- |
 -- Module        : Network.Wai.Handler.Warp
@@ -27,8 +28,11 @@ import qualified System.IO
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as S
+import qualified Data.ByteString.Unsafe as S
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy as L
+import Data.Word (Word8)
+import Data.List (foldl', foldl1')
 import Network
     ( listenOn, sClose, PortID(PortNumber), Socket
     , withSocketsDo)
@@ -40,7 +44,6 @@ import Control.Exception (bracket, finally, Exception, SomeException, catch)
 import System.IO (Handle, hClose, hFlush)
 import System.IO.Error (isEOFError, ioeGetHandle)
 import Control.Concurrent (forkIO)
-import Control.Monad (unless, when)
 import Data.Maybe (fromMaybe)
 
 import Data.Typeable (Typeable)
@@ -56,10 +59,10 @@ import Blaze.ByteString.Builder.HTTP
 import Blaze.ByteString.Builder
     (copyByteString, Builder, toLazyByteString, toByteStringIO)
 import Blaze.ByteString.Builder.Char8 (fromChar, fromString)
-import Data.Monoid (mconcat, mappend)
+import Data.Monoid (mappend, mempty)
 import Network.Socket.SendFile (sendFile)
 
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import System.Timeout (timeout)
 
 run :: Port -> Application -> IO ()
@@ -85,17 +88,19 @@ serveConnection port app conn remoteHost' = do
         ignoreAll
   where
     ignoreAll :: SomeException -> IO ()
-    ignoreAll _ = return ()
+    ignoreAll e = return ()
     fromClient = enumSocket bytesPerRead conn
     serveConnection' = do
         (enumeratee, env) <- parseRequest port remoteHost'
         res <- E.joinI $ enumeratee $$ app env
         keepAlive <- liftIO $ sendResponse env (httpVersion env) conn res
-        when keepAlive serveConnection'
+        if keepAlive 
+           then serveConnection'
+           else return ()
 
 parseRequest :: Port -> SockAddr -> E.Iteratee S.ByteString IO (E.Enumeratee ByteString ByteString IO a, Request)
 parseRequest port remoteHost' = do
-    headers' <- takeUntilBlank 0 id
+    headers' <- takeHeaders
     parseRequest' port headers' remoteHost'
 
 -- FIXME come up with good values here
@@ -103,39 +108,70 @@ maxHeaders, maxHeaderLength, bytesPerRead, readTimeout :: Int
 maxHeaders = 30
 maxHeaderLength = 1024
 bytesPerRead = 4096
-readTimeout = 3000000
+readTimeout = 30000000
 
-takeUntilBlank :: Int
-               -> ([ByteString] -> [ByteString])
-               -> E.Iteratee S.ByteString IO [ByteString]
-takeUntilBlank count _
-    | count > maxHeaders = E.throwError TooManyHeaders
-takeUntilBlank count front = do
-    l <- takeLine 0 id
-    if B.null l
-        then return $ front []
-        else takeUntilBlank (count + 1) $ front . (:) l
+takeHeaders :: E.Iteratee S.ByteString IO [ByteString]
+takeHeaders = do
+  !x <- forceHead
+  takeHeaders' 0 id 0 id x
+{-# INLINE takeHeaders #-}
 
-takeLine :: Int
-         -> ([ByteString] -> [ByteString])
-         -> E.Iteratee ByteString IO ByteString
-takeLine len front = do
-    mbs <- E.head
-    case mbs of
-        Nothing -> E.throwError IncompleteHeaders
-        Just bs -> do
-            let (x, y) = S.breakByte 10 bs
-                x' = if S.length x > 0 && S.last x == 13
-                        then S.init x
-                        else x
-            let len' = len + B.length x
-            case () of
-                ()
-                    | len' > maxHeaderLength -> E.throwError OverLargeHeader
-                    | B.null y -> takeLine len' $ front . (:) x
-                    | otherwise -> do
-                        E.yield () $ E.Chunks [B.drop 1 y]
-                        return $ B.concat $ front [x']
+takeHeaders' :: Int
+           -> ([ByteString] -> [ByteString])
+           -> Int
+           -> ([ByteString] -> [ByteString])
+           -> ByteString
+           -> E.Iteratee S.ByteString IO [ByteString]
+takeHeaders' !n !lines !lineLen !prepend !bs = do
+  let !bsLen = {-# SCC "takeHeaders'.bsLen" #-} S.length bs
+      !mnl = {-# SCC "takeHeaders'.mnl" #-} S.elemIndex 10 bs
+  case mnl of
+       -- no newline.  prepend entire bs to next line
+       !Nothing -> {-# SCC "takeHeaders'.noNewline" #-} do
+         let !lineLen' = lineLen + bsLen
+         if {-# SCC "takeHeaders'.checkMaxHeaderLength" #-} lineLen' > maxHeaderLength 
+            then E.throwError OverLargeHeader
+            else do 
+              !more <- forceHead 
+              takeHeaders' n lines lineLen' (prepend . (:) bs) more
+       Just !nl -> {-# SCC "takeHeaders'.newline" #-} do
+         let !end = nl - 1
+             !start = nl + 1
+             !line = {-# SCC "takeHeaders'.line" #-}
+                     if end > 0
+                        -- line data included in this chunk
+                        then S.concat $! prepend [S.unsafeTake end bs]
+                        -- no line data in this chunk (all in prepend, or empty line)
+                        else S.concat $! prepend []
+         if S.null line
+            -- no more headers
+            then {-# SCC "takeHeaders'.noMoreHeaders" #-} do
+              let !lines' = {-# SCC "takeHeaders'.noMoreHeaders.lines'" #-} lines []
+              if start < bsLen
+                 then {-# SCC "takeHeaders'.noMoreHeaders.yield" #-} do
+                   let !rest = {-# SCC "takeHeaders'.noMoreHeaders.yield.rest" #-} S.unsafeDrop start bs
+                   E.yield lines' $! E.Chunks [rest]
+                 else return lines'
+
+            -- more headers
+            else {-# SCC "takeHeaders'.moreHeaders" #-} do
+              let !n' = n + 1
+              if {-# SCC "takeHeaders'.checkMaxHeaders" #-} n' > maxHeaders 
+                 then E.throwError TooManyHeaders
+                 else do
+                   let !lines' = {-# SCC "takeHeaders.lines'" #-} lines . (:) line
+                   !more <- {-# SCC "takeHeaders'.more" #-} 
+                            if start < bsLen
+                               then return $! S.unsafeDrop start bs
+                               else forceHead
+                   {-# SCC "takeHeaders'.takeMore" #-} takeHeaders' n' lines' 0 id more
+
+forceHead = do
+  !mx <- E.head
+  case mx of
+       !Nothing -> E.throwError IncompleteHeaders
+       Just !x -> return x
+{-# INLINE forceHead #-}
 
 data InvalidRequest =
     NotEnoughLines [String]
@@ -153,28 +189,30 @@ parseRequest' :: Port
               -> [ByteString]
               -> SockAddr
               -> E.Iteratee S.ByteString IO (E.Enumeratee S.ByteString S.ByteString IO a, Request)
-parseRequest' port lines' remoteHost' = do
-    (firstLine, otherLines) <-
-        case lines' of
-            x:xs -> return (x, xs)
-            [] -> E.throwError $ NotEnoughLines $ map B.unpack lines'
+parseRequest' _ [] _ = E.throwError $ NotEnoughLines []
+parseRequest' port (firstLine:otherLines) remoteHost' = do
     (method, rpath', gets, httpversion) <- parseFirst firstLine
-    let rpath = '/' : case B.unpack rpath' of
-                        ('/':x) -> x
-                        _ -> B.unpack rpath'
-    let heads = map (first mkCIByteString . parseHeaderNoAttr) otherLines
-    let host = fromMaybe "" $ lookup "host" heads
-    let len = fromMaybe 0 $ do
-                bs <- lookup "Content-Length" heads
-                let str = B.unpack bs
-                case reads str of
-                    (x, _):_ -> Just x
-                    _ -> Nothing
-    let (serverName', _) = B.break (== ':') host
+    let rpath = {-# SCC "parseRequest'.rpath" #-} 
+                if B.null rpath'
+                   then "/"
+                   else if '/' == B.head rpath'
+                           then rpath'
+                           else B.cons '/' rpath'
+    let heads = {-# SCC "parseRequest'.heads" #-} map parseHeaderNoAttr otherLines
+    let host = {-# SCC "parseRequest'.host" #-} fromMaybe "" $ lookup "host" heads
+    let len = {-# SCC "parseRequest'.len" #-}
+              case lookup "Content-Length" heads of
+                   Nothing -> 0
+                   Just bs ->
+                     let str = B.unpack bs
+                     in case reads str of
+                             (x, _):_ -> x
+                             _ -> 0
+    let serverName' = {-# SCC "parseRequest'.serverName'" #-} takeUntil 58 host  -- ':'
     return (requestBodyHandle len, Request
                 { requestMethod = method
                 , httpVersion = httpversion
-                , pathInfo = B.pack rpath
+                , pathInfo = rpath
                 , queryString = gets
                 , serverName = serverName'
                 , serverPort = port
@@ -184,40 +222,54 @@ parseRequest' port lines' remoteHost' = do
                 , remoteHost = remoteHost'
                 })
 
+takeUntil :: Word8 -> ByteString -> ByteString
+takeUntil c bs = 
+  case S.elemIndex c bs of
+       Just !idx -> S.unsafeTake idx bs
+       Nothing -> bs
+{-# INLINE takeUntil #-}
+
 parseFirst :: ByteString
            -> E.Iteratee S.ByteString IO (ByteString, ByteString, ByteString, HttpVersion)
 parseFirst s = do
-    let pieces = B.words s
-    (method, query, http') <-
-        case pieces of
-            [x, y, z] -> return (x, y, z)
-            _ -> E.throwError $ BadFirstLine $ B.unpack s
-    let (hfirst, hsecond) = B.splitAt 5 http'
-    unless (hfirst == "HTTP/") $ E.throwError NonHttp
-    let (rpath, qstring) = B.break (== '?') query
-    return (method, rpath, qstring, hsecond)
+    let !pieces = {-# SCC "parseFirst.pieces" #-} S.split 32 s  -- ' '
+    case pieces of
+         [method, query, http'] 
+           | B.isPrefixOf "HTTP/" http' -> do
+             let !httpVersion = {-# SCC "parseFirst.httpVersion" #-} S.unsafeDrop 5 http'
+                 (!rpath, !qstring) = {-# SCC "parseFirst.(rpath,qstring)" #-} S.breakByte 63 query  -- '?'
+             return (method, rpath, qstring, httpVersion)
+           | otherwise -> E.throwError NonHttp
+         _ -> E.throwError $ BadFirstLine $ B.unpack s
+{-# INLINE parseFirst #-}
+
+httpBuilder = copyByteString "HTTP/"
+spaceBuilder = fromChar ' '
+newlineBuilder = copyByteString "\r\n"
+transferEncodingBuilder = copyByteString "Transfer-Encoding: chunked\r\n\r\n"
+colonSpaceBuilder = copyByteString ": "
 
 headers :: HttpVersion -> Status -> ResponseHeaders -> Bool -> Builder
-headers httpversion status responseHeaders isChunked' = mconcat
-    [ copyByteString "HTTP/"
-    , copyByteString httpversion
-    , fromChar ' '
-    , fromString $ show $ statusCode status
-    , fromChar ' '
-    , copyByteString $ statusMessage status
-    , copyByteString "\r\n"
-    , mconcat $ map go responseHeaders
-    , if isChunked'
-        then copyByteString "Transfer-Encoding: chunked\r\n\r\n"
-        else copyByteString "\r\n"
-    ]
-  where
-    go (x, y) = mconcat
-        [ copyByteString $ ciOriginal x
-        , copyByteString ": "
-        , copyByteString y
-        , copyByteString "\r\n"
-        ]
+headers !httpversion !status !responseHeaders !isChunked' = {-# SCC "headers" #-}
+    let !start = httpBuilder
+                `mappend` copyByteString httpversion
+                `mappend` spaceBuilder
+                `mappend` (fromString $ show $ statusCode status)
+                `mappend` spaceBuilder
+                `mappend` (copyByteString $ statusMessage status)
+                `mappend` newlineBuilder
+        !start' = foldl' responseHeaderToBuilder start responseHeaders
+        !end = if isChunked'
+                 then transferEncodingBuilder
+                 else newlineBuilder
+    in mappend start' end
+
+responseHeaderToBuilder :: Builder -> (CIByteString, ByteString) -> Builder
+responseHeaderToBuilder b (x, y) = b
+  `mappend` (copyByteString $ ciOriginal x)
+  `mappend` colonSpaceBuilder
+  `mappend` copyByteString y
+  `mappend` newlineBuilder
 
 isChunked :: HttpVersion -> Bool
 isChunked = (==) http11
@@ -226,7 +278,7 @@ hasBody :: Status -> Request -> Bool
 hasBody s req = s /= (Status 204 "") && requestMethod req /= "HEAD"
 
 sendResponse :: Request -> HttpVersion -> Socket -> Response -> IO Bool
-sendResponse req hv socket (ResponseFile s hs fp) = do
+sendResponse req hv socket (ResponseFile s hs fp) = {-# SCC "sendResponseFile" #-} do
     Sock.sendMany socket $ L.toChunks $ toLazyByteString $ headers hv s hs False
     if hasBody s req
         then do
@@ -246,47 +298,45 @@ sendResponse req hv socket (ResponseBuilder s hs b) = do
     hasLength = lookup "content-length" hs /= Nothing
     isChunked' = isChunked hv && not hasLength
     isKeepAlive = isChunked' || hasLength
-sendResponse req hv socket (ResponseEnumerator res) =
+sendResponse req hv socket (ResponseEnumerator res) = {-# SCC "sendResponseEnumerator" #-}
     res go
   where
     go s hs
-        | not (hasBody s req) = do
-            liftIO $ Sock.sendMany socket
-                   $ L.toChunks $ toLazyByteString
-                   $ headers hv s hs False
+        | not (hasBody s req) = {-# SCC "sendResponseEnumerator.noBody" #-} do
+            {-# SCC "sendResponseEnumerator.noBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs False] 
+            {-# SCC "sendResponseEnumerator.noBody.iterSocket" #-} iterSocket socket
             return True
-    go s hs =
-            chunk'
-          $ E.enumList 1 [headers hv s hs isChunked']
-         $$ E.joinI $ builderToByteString
-         $$ (iterSocket socket >> return isKeepAlive)
+    go s hs = {-# SCC "sendResponseEnumerator.hasBody" #-} 
+            chunk' $ do
+              {-# SCC "sendResponseEnumerator.hasBody.headers" #-} E.yield 0 $ E.Chunks [headers hv s hs isChunked'] 
+              {-# SCC "sendResponseEnumerator.hasBody.iterSocket" #-} iterSocket socket
+              return isKeepAlive
       where
-        hasLength = lookup "content-length" hs /= Nothing
-        isChunked' = isChunked hv && not hasLength
-        isKeepAlive = isChunked' || hasLength
-        chunk' i =
+        hasLength = {-# SCC "sendResponseEnumerator.hasBody.hasLength" #-} lookup "content-length" hs /= Nothing
+        isChunked' = {-# SCC "sendResponseEnumerator.hasBody.isChunked'" #-} isChunked hv && not hasLength
+        isKeepAlive = {-# SCC "sendResponseEnumerator.hasBody.isKeepAlive" #-} isChunked' || hasLength
+        chunk' i = {-# SCC "sendResponseEnumerator.hasBody.chunk'" #-}
             if isChunked'
                 then E.joinI $ chunk $$ i
                 else i
         chunk :: E.Enumeratee Builder Builder IO Bool
-        chunk = E.checkDone $ E.continue . step
-        step k E.EOF = k (E.Chunks [chunkedTransferTerminator]) >>== return
-        step k (E.Chunks []) = E.continue $ step k
-        step k (E.Chunks builders) =
+        chunk = {-# SCC "sendResponseEnumerator.hasBody.chunk" #-} E.checkDone $ E.continue . step
+        step k E.EOF = {-# SCC "sendResponseEnumerator.hasBody.stepEOF" #-} k (E.Chunks [chunkedTransferTerminator]) >>== return
+        step k (E.Chunks []) = {-# SCC "sendResponseEnumerator.hasBody.stepEmptyChunks" #-} E.continue $ step k
+        step k (E.Chunks builders) = {-# SCC "sendResponseEnumerator.hasBody.stepChunks" #-}
             k (E.Chunks [chunked]) >>== chunk
           where
-            chunked = chunkedTransferEncoding $ mconcat builders
+            chunked = {-# SCC "sendResponseEnumerator.hasBody.stepChunks.chunked" #-} chunkedTransferEncoding $ foldl1' mappend builders
 
-parseHeaderNoAttr :: ByteString -> (ByteString, ByteString)
+parseHeaderNoAttr :: ByteString -> (CIByteString, ByteString)
 parseHeaderNoAttr s =
-    let (k, rest) = B.span (/= ':') s
-        rest' = if not (B.null rest) &&
-                   B.head rest == ':' &&
-                   not (B.null $ B.tail rest) &&
-                   B.head (B.tail rest) == ' '
-                    then B.drop 2 rest
-                    else rest
-     in (k, rest')
+    let (k, rest) = S.breakByte 58 s  -- ':'
+        restLen = {-# SCC "parseHeaderNoAttr.restLen" #-} S.length rest
+        rest' = {-# SCC "parseHeaderNoAttr.rest'" #-} 
+                if restLen > 1 && S.unsafeTake 2 rest == ": "
+                   then S.unsafeDrop 2 rest
+                   else rest
+     in (mkCIByteString k, rest')
 
 requestBodyHandle :: Int
                   -> E.Enumeratee ByteString ByteString IO a
@@ -320,11 +370,15 @@ requestBodyHandle initLen =
             E.yield () $ E.Chunks [y]
             return (x, 0)
 
+iterSocket :: MonadIO m => Socket -> E.Iteratee Builder m ()
 iterSocket socket =
-    E.continue go
+    E.continue $ go mempty
   where
-    go E.EOF = E.yield () E.EOF
-    go (E.Chunks cs) = liftIO (Sock.sendMany socket cs) >> E.continue go
+    go !b E.EOF = do
+      liftIO $ Sock.sendMany socket $ L.toChunks $ toLazyByteString b
+      E.yield () E.EOF
+    go !b (E.Chunks [cs]) = do
+      E.continue $ go $ mappend b cs
 
 enumSocket len socket (E.Continue k) = do
 #if NO_TIMEOUT_PROTECTION
