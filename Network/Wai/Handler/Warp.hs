@@ -320,7 +320,9 @@ sendResponse req hv socket (ResponseFile s hs fp) = {-# SCC "sendResponseFile" #
         else return True
 sendResponse req hv socket (ResponseBuilder s hs b) = do
     toByteStringIO (Sock.sendAll socket) b'
-    toByteStringIO (Sock.sendAll socket) chunkedTransferTerminator
+    if isChunked'
+       then toByteStringIO (Sock.sendAll socket) chunkedTransferTerminator
+       else return ()
     return isKeepAlive
   where
     b' =
