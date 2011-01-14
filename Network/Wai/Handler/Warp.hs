@@ -95,7 +95,7 @@ serveConnection port app conn remoteHost' = do
         ignoreAll
   where
     ignoreAll :: SomeException -> IO ()
-    ignoreAll e = print e -- return ()
+    ignoreAll e = return ()
     fromClient = enumSocket bytesPerRead conn
     serveConnection' = do
         (enumeratee, env) <- parseRequest port remoteHost'
@@ -310,6 +310,10 @@ isChunked = (==) http11
 hasBody :: Status -> Request -> Bool
 hasBody s req = s /= (Status 204 "") && requestMethod req /= "HEAD"
 
+single :: a -> [a]
+single a = [a]
+{-# INLINE single #-}
+
 sendResponse :: Request -> HttpVersion -> Socket -> Response -> IO Bool
 sendResponse req hv socket (ResponseFile s hs fp) = {-# SCC "sendResponseFile" #-} do
     Sock.sendMany socket $ L.toChunks $ toLazyByteString $ headers hv s hs False
@@ -319,9 +323,9 @@ sendResponse req hv socket (ResponseFile s hs fp) = {-# SCC "sendResponseFile" #
             return $ lookup "content-length" hs /= Nothing
         else return True
 sendResponse req hv socket (ResponseBuilder s hs b) = do
-    toByteStringIO (Sock.sendAll socket) b'
+    toByteStringIO (Sock.sendMany socket . single) b'
     if isChunked'
-       then toByteStringIO (Sock.sendAll socket) chunkedTransferTerminator
+       then toByteStringIO (Sock.sendMany socket . single) chunkedTransferTerminator
        else return ()
     return isKeepAlive
   where
@@ -439,7 +443,8 @@ iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI 
     {-# INLINE createBufferI #-}
     createBufferI :: MonadIO m => Bool -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
     createBufferI !first !bufSize !E.EOF = E.continue (createBufferI first bufSize)
-    createBufferI !first !bufSize (E.Chunks [BI.Builder !b]) = 
+    createBufferI !first !bufSize (E.Chunks bs) = do
+      let BI.Builder !b = foldl1' mappend bs
       createBuffer first bufSize (b (BI.buildStep finalStep))
 
     {-# INLINE reuseBufferI #-}
@@ -451,7 +456,8 @@ iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI 
                      else [S.PS fpbuf 0 offset]
       liftIO $ io $ bufs
       E.yield () E.EOF
-    reuseBufferI !first !bufSize !fpbuf !offset (E.Chunks [BI.Builder !b]) = 
+    reuseBufferI !first !bufSize !fpbuf !offset (E.Chunks bs) = do
+      let BI.Builder !b = foldl1' mappend bs
       fillBuffer first bufSize fpbuf offset (b (BI.buildStep finalStep))
 
     {-# INLINE createBuffer #-}
