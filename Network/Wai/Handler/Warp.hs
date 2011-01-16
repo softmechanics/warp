@@ -309,9 +309,6 @@ enumSocket _ _ step = E.returnI step
 ------ The functions below are not warp-specific and could be split out into a
 --separate package.
 
-takeHeaders :: E.Iteratee ByteString IO [ByteString]
-takeHeaders = takeUntilBlank 0 id
-
 takeUntilBlank :: Int
                -> ([ByteString] -> [ByteString])
                -> E.Iteratee S.ByteString IO [ByteString]
@@ -343,5 +340,68 @@ takeLineMax len front = do
                     | otherwise -> do
                         E.yield () $ E.Chunks [B.drop 1 y]
                         return $ B.concat $ front [x']
+
+takeHeaders :: E.Iteratee S.ByteString IO [ByteString]
+takeHeaders = do
+  !x <- forceHead
+  takeHeaders' 0 id 0 id x
+{-# INLINE takeHeaders #-}
+
+takeHeaders' :: Int
+             -> ([ByteString] -> [ByteString])
+             -> Int
+             -> ([ByteString] -> [ByteString])
+             -> ByteString
+             -> E.Iteratee S.ByteString IO [ByteString]
+takeHeaders' !n !lines !lineLen !prepend !bs = do
+  let !bsLen = {-# SCC "takeHeaders'.bsLen" #-} S.length bs
+      !mnl = {-# SCC "takeHeaders'.mnl" #-} S.elemIndex 10 bs
+  case mnl of
+       -- no newline.  prepend entire bs to next line
+       !Nothing -> {-# SCC "takeHeaders'.noNewline" #-} do
+         let !lineLen' = lineLen + bsLen
+         if {-# SCC "takeHeaders'.checkMaxHeaderLength" #-} lineLen' > maxHeaderLength 
+            then E.throwError OverLargeHeader
+            else do 
+              !more <- forceHead 
+              takeHeaders' n lines lineLen' (prepend . (:) bs) more
+       Just !nl -> {-# SCC "takeHeaders'.newline" #-} do
+         let !end = nl - 1
+             !start = nl + 1
+             !line = {-# SCC "takeHeaders'.line" #-}
+                     if end > 0
+                        -- line data included in this chunk
+                        then S.concat $! prepend [SU.unsafeTake end bs]
+                        -- no line data in this chunk (all in prepend, or empty line)
+                        else S.concat $! prepend []
+         if S.null line
+            -- no more headers
+            then {-# SCC "takeHeaders'.noMoreHeaders" #-} do
+              let !lines' = {-# SCC "takeHeaders'.noMoreHeaders.lines'" #-} lines []
+              if start < bsLen
+                 then {-# SCC "takeHeaders'.noMoreHeaders.yield" #-} do
+                   let !rest = {-# SCC "takeHeaders'.noMoreHeaders.yield.rest" #-} SU.unsafeDrop start bs
+                   E.yield lines' $! E.Chunks [rest]
+                 else return lines'
+
+            -- more headers
+            else {-# SCC "takeHeaders'.moreHeaders" #-} do
+              let !n' = n + 1
+              if {-# SCC "takeHeaders'.checkMaxHeaders" #-} n' > maxHeaders 
+                 then E.throwError TooManyHeaders
+                 else do
+                   let !lines' = {-# SCC "takeHeaders.lines'" #-} lines . (:) line
+                   !more <- {-# SCC "takeHeaders'.more" #-} 
+                            if start < bsLen
+                               then return $! SU.unsafeDrop start bs
+                               else forceHead
+                   {-# SCC "takeHeaders'.takeMore" #-} takeHeaders' n' lines' 0 id more
+
+forceHead = do
+  !mx <- E.head
+  case mx of
+       !Nothing -> E.throwError IncompleteHeaders
+       Just !x -> return x
+{-# INLINE forceHead #-}
 
 

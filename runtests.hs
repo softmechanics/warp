@@ -5,7 +5,7 @@ import Test.Framework (defaultMain, testGroup, Test)
 import Test.Framework.Providers.HUnit
 import Test.HUnit hiding (Test)
 
-import Network.Wai.Handler.Warp (takeLineMax, takeHeaders, InvalidRequest (..))
+import Network.Wai.Handler.Warp (takeLineMax, takeHeaders, takeUntilBlank, InvalidRequest (..))
 import Data.Enumerator (run_, ($$), enumList, run)
 import Control.Exception (fromException)
 
@@ -32,8 +32,12 @@ caseTakeLineMaxSafe = do
         return (a, b, c, d, e)
     x @?= ("foo", "", "bar", "", "baz")
 
+caseTakeHeadersSafe = do
+    x <- run_ $ (enumList 1 ["f", "oo\r\n", "bar\r\nbaz\r\n\r\n"]) $$ takeHeaders
+    x @?= ["foo", "bar", "baz"]
+
 caseTakeUntilBlankSafe = do
-    x <- run_ $ (enumList 1 ["f", "oo\n", "bar\nbaz\n\r\n"]) $$ takeHeaders
+    x <- run_ $ (enumList 1 ["f", "oo\n", "bar\nbaz\n\r\n"]) $$ takeUntilBlank 0 id
     x @?= ["foo", "bar", "baz"]
 
 caseTakeLineMaxUnsafe = do
@@ -63,7 +67,7 @@ caseTakeLineMaxIncomplete = do
     assertException IncompleteHeaders x
 
 caseTakeUntilBlankTooMany = do
-    x <- run $ (enumList 1 $ repeat "f\n") $$ takeHeaders
+    x <- run $ (enumList 1 $ repeat "f\r\n") $$ takeHeaders
     assertException TooManyHeaders x
 
 caseTakeUntilBlankTooLarge = do
