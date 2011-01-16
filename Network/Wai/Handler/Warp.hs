@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE PackageImports #-}
 ---------------------------------------------------------
 -- |
 -- Module        : Network.Wai.Handler.Warp
@@ -20,11 +21,10 @@ module Network.Wai.Handler.Warp
     ( run
     , sendResponse
     , parseRequest
-#if TEST
     , takeLineMax
     , takeHeaders
+    , takeUntilBlank
     , InvalidRequest (..)
-#endif
     ) where
 
 import Prelude hiding (catch)
@@ -42,7 +42,7 @@ import Network
 import Network.Socket
     ( accept, SockAddr
     )
-import qualified Network.Socket.ByteString as Sock
+import qualified "network" Network.Socket.ByteString as Sock
 import Control.Exception (bracket, finally, Exception, SomeException, catch)
 import Control.Concurrent (forkIO)
 import Data.Maybe (fromMaybe)
@@ -343,3 +343,5 @@ takeLineMax len front = do
                     | otherwise -> do
                         E.yield () $ E.Chunks [B.drop 1 y]
                         return $ B.concat $ front [x']
+
+

@@ -13,7 +13,7 @@ main :: IO ()
 main = defaultMain [testSuite]
 
 testSuite :: Test
-testSuite = testGroup "Text.Hamlet"
+testSuite = testGroup "Warp Unit Tests"
     [ testCase "takeLineMax safe" caseTakeLineMaxSafe
     , testCase "takeUntilBlank safe" caseTakeUntilBlankSafe
     , testCase "takeLineMax unsafe" caseTakeLineMaxUnsafe
