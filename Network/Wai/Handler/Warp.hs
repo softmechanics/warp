@@ -366,12 +366,13 @@ takeHeaders' !n !lines !lineLen !prepend !bs = do
               !more <- forceHead 
               takeHeaders' n lines lineLen' (prepend . (:) bs) more
        Just !nl -> {-# SCC "takeHeaders'.newline" #-} do
-         let !end = nl - 1
+         let !end = nl 
              !start = nl + 1
              !line = {-# SCC "takeHeaders'.line" #-}
                      if end > 0
                         -- line data included in this chunk
-                        then S.concat $! prepend [SU.unsafeTake end bs]
+                        then S.concat $! prepend [SU.unsafeTake (checkCR bs end) bs]
+                        --then S.concat $! prepend [SU.unsafeTake (end-1) bs]
                         -- no line data in this chunk (all in prepend, or empty line)
                         else S.concat $! prepend []
          if S.null line
@@ -404,4 +405,10 @@ forceHead = do
        Just !x -> return x
 {-# INLINE forceHead #-}
 
+checkCR bs pos = 
+  let !p = pos - 1
+  in if '\r' == B.index bs p
+        then p
+        else pos
+{-# INLINE checkCR #-}
 
