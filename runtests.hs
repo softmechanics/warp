@@ -16,8 +16,11 @@ testSuite :: Test
 testSuite = testGroup "Warp Unit Tests"
     [ testCase "takeLineMax safe" caseTakeLineMaxSafe
     , testCase "takeUntilBlank safe" caseTakeUntilBlankSafe
+    , testCase "takeHeaders safe" caseTakeHeadersSafe
     , testCase "takeLineMax unsafe" caseTakeLineMaxUnsafe
     , testCase "takeLineMax incomplete" caseTakeLineMaxIncomplete
+    , testCase "takeHeaders too many lines" caseTakeHeadersTooMany
+    , testCase "takeHeaders too large" caseTakeHeadersTooLarge
     , testCase "takeUntilBlank too many lines" caseTakeUntilBlankTooMany
     , testCase "takeUntilBlank too large" caseTakeUntilBlankTooLarge
     ]
@@ -33,11 +36,11 @@ caseTakeLineMaxSafe = do
     x @?= ("foo", "", "bar", "", "baz")
 
 caseTakeHeadersSafe = do
-    x <- run_ $ (enumList 1 ["f", "oo\r\n", "bar\r\nbaz\r\n\r\n"]) $$ takeHeaders
+    x <- run_ $ (enumList 1 ["f", "oo\n", "bar\r\nbaz\n\r\n"]) $$ takeHeaders
     x @?= ["foo", "bar", "baz"]
 
 caseTakeUntilBlankSafe = do
-    x <- run_ $ (enumList 1 ["f", "oo\n", "bar\nbaz\n\r\n"]) $$ takeUntilBlank 0 id
+    x <- run_ $ (enumList 1 ["f", "oo\n", "bar\r\nbaz\n\r\n"]) $$ takeUntilBlank 0 id
     x @?= ["foo", "bar", "baz"]
 
 caseTakeLineMaxUnsafe = do
@@ -66,10 +69,18 @@ caseTakeLineMaxIncomplete = do
         return (a, b, c, d, e)
     assertException IncompleteHeaders x
 
-caseTakeUntilBlankTooMany = do
+caseTakeHeadersTooMany = do
     x <- run $ (enumList 1 $ repeat "f\r\n") $$ takeHeaders
     assertException TooManyHeaders x
 
-caseTakeUntilBlankTooLarge = do
+caseTakeHeadersTooLarge = do
     x <- run $ (enumList 1 $ repeat "f") $$ takeHeaders
+    assertException OverLargeHeader x
+
+caseTakeUntilBlankTooMany = do
+    x <- run $ (enumList 1 $ repeat "f\r\n") $$ takeUntilBlank 0 id
+    assertException TooManyHeaders x
+
+caseTakeUntilBlankTooLarge = do
+    x <- run $ (enumList 1 $ repeat "f") $$ takeUntilBlank 0 id
     assertException OverLargeHeader x
