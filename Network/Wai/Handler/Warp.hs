@@ -357,6 +357,7 @@ takeHeaders' :: Int
              -> ([ByteString] -> [ByteString])
              -> ByteString
              -> E.Iteratee S.ByteString IO [ByteString]
+takeHeaders' !len _ _ _ | len > maxTotalHeaderLength = E.throwError OverLargeHeader
 takeHeaders' !len !lines !prepend !bs = do
   let !bsLen = {-# SCC "takeHeaders'.bsLen" #-} S.length bs
       !mnl = {-# SCC "takeHeaders'.mnl" #-} S.elemIndex 10 bs
@@ -364,11 +365,8 @@ takeHeaders' !len !lines !prepend !bs = do
        -- no newline.  prepend entire bs to next line
        !Nothing -> {-# SCC "takeHeaders'.noNewline" #-} do
          let !len' = len + bsLen
-         if {-# SCC "takeHeaders'.checkMaxHeaderLength" #-} len' > maxTotalHeaderLength
-            then E.throwError OverLargeHeader
-            else do 
-              !more <- forceHead 
-              takeHeaders' len' lines (prepend . (:) bs) more
+         !more <- forceHead 
+         takeHeaders' len' lines (prepend . (:) bs) more
        Just !nl -> {-# SCC "takeHeaders'.newline" #-} do
          let !end = nl 
              !start = nl + 1
@@ -392,15 +390,12 @@ takeHeaders' !len !lines !prepend !bs = do
             -- more headers
             else {-# SCC "takeHeaders'.moreHeaders" #-} do
               let !len' = len + start 
-              if {-# SCC "takeHeaders'.checkMaxHeaders" #-} len' > maxTotalHeaderLength
-                 then E.throwError OverLargeHeader
-                 else do
-                   let !lines' = {-# SCC "takeHeaders.lines'" #-} lines . (:) line
-                   !more <- {-# SCC "takeHeaders'.more" #-} 
-                            if start < bsLen
-                               then return $! SU.unsafeDrop start bs
-                               else forceHead
-                   {-# SCC "takeHeaders'.takeMore" #-} takeHeaders' len' lines' id more
+                  !lines' = {-# SCC "takeHeaders.lines'" #-} lines . (:) line
+              !more <- {-# SCC "takeHeaders'.more" #-} 
+                       if start < bsLen
+                          then return $! SU.unsafeDrop start bs
+                          else forceHead
+              {-# SCC "takeHeaders'.takeMore" #-} takeHeaders' len' lines' id more
 
 forceHead = do
   !mx <- E.head
