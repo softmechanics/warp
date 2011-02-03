@@ -42,7 +42,7 @@ import Network
 import Network.Socket
     ( accept, SockAddr
     )
-import qualified "network" Network.Socket.ByteString as Sock
+import qualified "network-bytestring" Network.Socket.ByteString as Sock
 import Control.Exception (bracket, finally, Exception, SomeException, catch)
 import Control.Concurrent (forkIO)
 import Data.Maybe (fromMaybe)
@@ -341,30 +341,34 @@ takeLineMax len front = do
                         E.yield () $ E.Chunks [B.drop 1 y]
                         return $ B.concat $ front [x']
 
+maxTotalHeaderLength = 50 * 1024
 takeHeaders :: E.Iteratee S.ByteString IO [ByteString]
+#if TAKE_UNTIL_BLANK
+takeHeaders = takeUntilBlank 0 id
+#else
 takeHeaders = do
   !x <- forceHead
-  takeHeaders' 0 id 0 id x
+  takeHeaders' 0 id id x
+#endif
 {-# INLINE takeHeaders #-}
 
 takeHeaders' :: Int
              -> ([ByteString] -> [ByteString])
-             -> Int
              -> ([ByteString] -> [ByteString])
              -> ByteString
              -> E.Iteratee S.ByteString IO [ByteString]
-takeHeaders' !n !lines !lineLen !prepend !bs = do
+takeHeaders' !len !lines !prepend !bs = do
   let !bsLen = {-# SCC "takeHeaders'.bsLen" #-} S.length bs
       !mnl = {-# SCC "takeHeaders'.mnl" #-} S.elemIndex 10 bs
   case mnl of
        -- no newline.  prepend entire bs to next line
        !Nothing -> {-# SCC "takeHeaders'.noNewline" #-} do
-         let !lineLen' = lineLen + bsLen
-         if {-# SCC "takeHeaders'.checkMaxHeaderLength" #-} lineLen' > maxHeaderLength 
+         let !len' = len + bsLen
+         if {-# SCC "takeHeaders'.checkMaxHeaderLength" #-} len' > maxTotalHeaderLength
             then E.throwError OverLargeHeader
             else do 
               !more <- forceHead 
-              takeHeaders' n lines lineLen' (prepend . (:) bs) more
+              takeHeaders' len' lines (prepend . (:) bs) more
        Just !nl -> {-# SCC "takeHeaders'.newline" #-} do
          let !end = nl 
              !start = nl + 1
@@ -387,16 +391,16 @@ takeHeaders' !n !lines !lineLen !prepend !bs = do
 
             -- more headers
             else {-# SCC "takeHeaders'.moreHeaders" #-} do
-              let !n' = n + 1
-              if {-# SCC "takeHeaders'.checkMaxHeaders" #-} n' > maxHeaders 
-                 then E.throwError TooManyHeaders
+              let !len' = len + start 
+              if {-# SCC "takeHeaders'.checkMaxHeaders" #-} len' > maxTotalHeaderLength
+                 then E.throwError OverLargeHeader
                  else do
                    let !lines' = {-# SCC "takeHeaders.lines'" #-} lines . (:) line
                    !more <- {-# SCC "takeHeaders'.more" #-} 
                             if start < bsLen
                                then return $! SU.unsafeDrop start bs
                                else forceHead
-                   {-# SCC "takeHeaders'.takeMore" #-} takeHeaders' n' lines' 0 id more
+                   {-# SCC "takeHeaders'.takeMore" #-} takeHeaders' len' lines' id more
 
 forceHead = do
   !mx <- E.head
