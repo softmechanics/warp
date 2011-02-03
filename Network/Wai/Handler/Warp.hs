@@ -396,6 +396,7 @@ takeHeaders' !len !lines !prepend !bs = do
                           then return $! SU.unsafeDrop start bs
                           else forceHead
               {-# SCC "takeHeaders'.takeMore" #-} takeHeaders' len' lines' id more
+{-# INLINE takeHeaders' #-}
 
 forceHead = do
   !mx <- E.head
