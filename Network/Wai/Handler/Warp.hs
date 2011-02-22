@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE PackageImports #-}
 ---------------------------------------------------------
 -- |
 -- Module        : Network.Wai.Handler.Warp
@@ -22,6 +23,8 @@ module Network.Wai.Handler.Warp
     , parseRequest
     ) where
 
+import Foreign
+import PokeHex
 import Prelude hiding (catch)
 import Network.Wai
 import qualified System.IO
@@ -428,6 +431,11 @@ iterBuilderWith :: MonadIO m
 iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI True bufSize')
   -- FIXME: if not chunked, send add headers to the buf (instead of toLazyByteString)
   where
+    maxBytesForChunkLength :: Int
+    maxBytesForChunkLength = ceiling $ logBase 16 $ fromIntegral $ bufSize' + 1
+    chunkHeaderSize = maxBytesForChunkLength + 2  -- length \r\n
+    bufOffset = if chunked then chunkHeaderSize else 0
+
     {-# INLINE addHeaders #-}
     addHeaders True bufs = (L.toChunks $ toLazyByteString headersBuilder) ++ bufs
     addHeaders _ bufs = bufs
@@ -440,6 +448,15 @@ iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI 
     endEOF | chunked = iterBuilderOnEOF
            | otherwise = []
 
+    {-# INLINE pokeChunkLen #-}
+    pokeChunkLen fpbuf totalLen | chunked = do
+      let !hexEnd = chunkHeaderSize - 3
+          !len = totalLen - chunkHeaderSize
+      withForeignPtr fpbuf $ \buf -> do
+        pokeHex buf hexEnd len
+
+    pokeChunkLen _ _ = return ()
+
     {-# INLINE createBufferI #-}
     createBufferI :: MonadIO m => Bool -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
     createBufferI !first !bufSize !E.EOF = E.continue (createBufferI first bufSize)
@@ -447,24 +464,35 @@ iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI 
       let BI.Builder !b = foldl1' mappend bs
       createBuffer first bufSize (b (BI.buildStep finalStep))
 
+    {-# INLINE createBuffer #-}
+    createBuffer :: MonadIO m => Bool -> Int -> BI.BuildStep () -> E.Iteratee Builder m ()
+    createBuffer !first !bufSize !b = do
+      fpbuf <- liftIO $ S.mallocByteString $ bufSize + bufOffset
+
+      -- prepare the buffer by writing the \r\n after the chunk length.
+      let !n = chunkHeaderSize - 1
+          !r = n - 1
+      liftIO $ withForeignPtr fpbuf $ \buf -> do
+        pokeByteOff buf n (10::Word8) -- \n
+        pokeByteOff buf r (13::Word8) -- \r
+
+      fillBuffer first bufSize fpbuf bufOffset b
+
     {-# INLINE reuseBufferI #-}
     reuseBufferI :: MonadIO m => Bool -> Int -> ForeignPtr Word8 -> Int -> E.Stream Builder -> E.Iteratee Builder m ()
     reuseBufferI !first !bufSize !fpbuf !offset E.EOF = do
       let !bufs = addHeaders first $ 
                   if chunked
-                     then iterBuilderChunker [S.PS fpbuf 0 offset] ++ endEOF
+                     then [S.PS fpbuf 0 offset] ++ endEOF
                      else [S.PS fpbuf 0 offset]
-      liftIO $ io $ bufs
+      liftIO $ do
+        pokeChunkLen fpbuf offset
+        io bufs
       E.yield () E.EOF
+
     reuseBufferI !first !bufSize !fpbuf !offset (E.Chunks bs) = do
       let BI.Builder !b = foldl1' mappend bs
       fillBuffer first bufSize fpbuf offset (b (BI.buildStep finalStep))
-
-    {-# INLINE createBuffer #-}
-    createBuffer :: MonadIO m => Bool -> Int -> BI.BuildStep () -> E.Iteratee Builder m ()
-    createBuffer !first !bufSize !b = do
-      let fpbuf = S.inlinePerformIO $ S.mallocByteString bufSize
-      fillBuffer first bufSize fpbuf 0 b
 
     {-# INLINE fillBuffer #-}
     fillBuffer !first !bufSize !fpbuf !offset !step = do
@@ -475,25 +503,29 @@ iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI 
           !signal = S.inlinePerformIO $ BI.runBuildStep step br
       case signal of
            BI.Done !pf' _ -> do
-             --liftIO $ print "Done"
              E.continue $ reuseBufferI first bufSize fpbuf (pf' `minusPtr` pf)
            
-           BI.BufferFull !minSize !pf' !nextStep  -> do
-             let !bufs = addHeaders first $ chunkBufs [S.PS fpbuf 0 (pf' `minusPtr` pf)]
-             liftIO $ io bufs
+           BI.BufferFull !minSize !pf' !nextStep -> do
+             let !len = pf' `minusPtr` pf
+                 !bufs = addHeaders first $ [S.PS fpbuf 0 len]
+             liftIO $ do
+               pokeChunkLen fpbuf len
+               io bufs
+
              if minSize > bufSize
                 -- alloc larger buffer
                 then createBuffer False minSize nextStep
                 -- reuse current buffer
-                else fillBuffer False bufSize fpbuf 0 nextStep
+                else fillBuffer False bufSize fpbuf bufOffset nextStep
                   
            BI.InsertByteString !pf' !bs !nextStep  -> do
-             let !end = if S.null bs
-                          then []
-                          else [bs]
-                 !bufs = addHeaders first $ chunkBufs $ S.PS fpbuf 0 (pf' `minusPtr` pf) : end
-             liftIO $ io bufs
-             fillBuffer False bufSize fpbuf 0 nextStep
+             let !len = pf' `minusPtr` pf
+                 !bufs = addHeaders first $ S.PS fpbuf 0 len : iterBuilderChunker [bs]
+             liftIO $ do
+               pokeChunkLen fpbuf len
+               io bufs
+                    
+             fillBuffer False bufSize fpbuf bufOffset nextStep
              
 
 -- extra data to send on EOF (probably a better way to do this...)
@@ -507,6 +539,7 @@ iterBuilderChunked = True
 iterBuilderChunked = False
 #endif
 
+-- prepend chunk length
 iterBuilderChunker :: [ByteString] -> [ByteString]
 iterBuilderChunker bufs = c:bufs
   where c = B.pack $ showHex len "\r\n"
