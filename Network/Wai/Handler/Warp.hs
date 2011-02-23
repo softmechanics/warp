@@ -432,21 +432,13 @@ iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI 
   -- FIXME: if not chunked, send add headers to the buf (instead of toLazyByteString)
   where
     maxBytesForChunkLength :: Int
-    maxBytesForChunkLength = ceiling $ logBase 16 $ fromIntegral $ bufSize' + 1
-    chunkHeaderSize = maxBytesForChunkLength + 2  -- length \r\n
-    bufOffset = if chunked then chunkHeaderSize else 0
+    !maxBytesForChunkLength = ceiling $ logBase 16 $ fromIntegral $ bufSize' + 1
+    !chunkHeaderSize = maxBytesForChunkLength + 2  -- length \r\n
+    !bufOffset = if chunked then chunkHeaderSize else 0
 
     {-# INLINE addHeaders #-}
     addHeaders True bufs = (L.toChunks $ toLazyByteString headersBuilder) ++ bufs
     addHeaders _ bufs = bufs
-
-    {-# INLINE chunkBufs #-}
-    chunkBufs | chunked = iterBuilderChunker 
-              | otherwise = id
-
-    {-# INLINE endEOF #-}
-    endEOF | chunked = iterBuilderOnEOF
-           | otherwise = []
 
     {-# INLINE pokeChunkLen #-}
     pokeChunkLen fpbuf totalLen | chunked = do
@@ -470,11 +462,11 @@ iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI 
       fpbuf <- liftIO $ S.mallocByteString $ bufSize + bufOffset
 
       -- prepare the buffer by writing the \r\n after the chunk length.
-      let !n = chunkHeaderSize - 1
-          !r = n - 1
       liftIO $ withForeignPtr fpbuf $ \buf -> do
-        pokeByteOff buf n (10::Word8) -- \n
+        let !r = maxBytesForChunkLength
+            !n = maxBytesForChunkLength + 1
         pokeByteOff buf r (13::Word8) -- \r
+        pokeByteOff buf n (10::Word8) -- \n
 
       fillBuffer first bufSize fpbuf bufOffset b
 
@@ -483,7 +475,7 @@ iterBuilderWith !bufSize' io chunked headersBuilder = E.continue (createBufferI 
     reuseBufferI !first !bufSize !fpbuf !offset E.EOF = do
       let !bufs = addHeaders first $ 
                   if chunked
-                     then [S.PS fpbuf 0 offset] ++ endEOF
+                     then [S.PS fpbuf 0 offset] ++ iterBuilderOnEOF
                      else [S.PS fpbuf 0 offset]
       liftIO $ do
         pokeChunkLen fpbuf offset
