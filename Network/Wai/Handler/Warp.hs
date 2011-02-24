@@ -160,19 +160,28 @@ serveConnection :: T.Handle
 serveConnection th onException port app conn remoteHost' = do
     catch
         (finally
-          (E.run_ $ fromClient $$ serveConnection')
+          (E.run_ $ fromClient $$ serveConnection' app)
           (sClose conn))
         onException
   where
     fromClient = enumSocket th bytesPerRead conn
-    serveConnection' = do
+    serveConnection' (AppEnum appe) = do
         (enumeratee, env) <- parseRequest port remoteHost'
         -- Let the application run for as long as it wants
         liftIO $ T.pause th
-        res <- E.joinI $ enumeratee $$ app env
+        -- TODO return keepAlive
+        keepAlive <- E.joinI $ enumeratee $$ appe env (sendResponseEnumeratee th env (httpVersion env) conn)
+        liftIO $ T.resume th
+        if keepAlive then serveConnection' app else return ()
+        
+    serveConnection' (AppIter appi) = do
+        (enumeratee, env) <- parseRequest port remoteHost'
+        -- Let the application run for as long as it wants
+        liftIO $ T.pause th
+        res <- E.joinI $ enumeratee $$ appi env
         liftIO $ T.resume th
         keepAlive <- liftIO $ sendResponse th env (httpVersion env) conn res
-        if keepAlive then serveConnection' else return ()
+        if keepAlive then serveConnection' app else return ()
 
 parseRequest :: Port -> SockAddr -> E.Iteratee S.ByteString IO (E.Enumeratee ByteString ByteString IO a, Request)
 parseRequest port remoteHost' = do
@@ -294,6 +303,36 @@ isChunked = (==) http11
 
 hasBody :: Status -> Request -> Bool
 hasBody s req = s /= (Status 204 "") && requestMethod req /= "HEAD"
+
+sendResponseEnumeratee :: T.Handle -> Request -> HttpVersion -> Socket -> Status -> ResponseHeaders -> E.Iteratee Builder IO Bool
+sendResponseEnumeratee th req hv socket = go
+  where
+    -- FIXME perhaps alloca a buffer per thread and reuse that in all functiosn below. Should lessen greatly the GC burden (I hope)
+    go s hs
+        | not (hasBody s req) = do
+            liftIO $ Sock.sendMany socket
+                   $ L.toChunks $ toLazyByteString
+                   $ headers hv s hs False
+            return True
+    go s hs =
+            chunk'
+          $ E.enumList 1 [headers hv s hs isChunked']
+         $$ E.joinI $ builderToByteString -- FIXME unsafeBuilderToByteString
+         $$ (iterSocket th socket >> return isKeepAlive)
+      where
+        hasLength = lookup "content-length" hs /= Nothing
+        isChunked' = isChunked hv && not hasLength
+        isKeepAlive = isChunked' || hasLength
+        chunk' i =
+            if isChunked'
+                then E.joinI $ chunk $$ i
+                else i
+        chunk :: E.Enumeratee Builder Builder IO Bool
+        chunk = E.checkDone $ E.continue . step
+        step k E.EOF = k (E.Chunks [chunkedTransferTerminator]) >>== return
+        step k (E.Chunks []) = E.continue $ step k
+        step k (E.Chunks [x]) = k (E.Chunks [chunkedTransferEncoding x]) >>== chunk
+        step k (E.Chunks xs) = k (E.Chunks [chunkedTransferEncoding $ mconcat xs]) >>== chunk
 
 sendResponse :: T.Handle
              -> Request -> HttpVersion -> Socket -> Response -> IO Bool
