@@ -151,7 +151,6 @@ serveConnections' set app socket = do
     tm <- T.initialize $ settingsTimeout set * 1000000
     forever $ do
         (conn, sa) <- accept socket
-        putStrLn "Accepted a connection"
         _ <- forkIO $ do
             th <- T.registerKillThread tm
             serveConnection th onE port app conn sa
